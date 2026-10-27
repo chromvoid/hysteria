@@ -258,3 +258,28 @@ func (d *dnsResolver) resolveDirect(ctx context.Context, host string) ([]net.IPA
 	}
 	return addresses, nil
 }
+
+func (d *dnsResolver) resolvePhysical(ctx context.Context, host string) ([]net.IPAddr, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	addresses, err := d.resolveDirect(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var physical []net.IPAddr
+	for _, address := range addresses {
+		resolved, err := physicalIPs(ctx, address.IP)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		physical = append(physical, resolved...)
+	}
+	if len(physical) == 0 {
+		return nil, errors.New("Could not resolve the physical network address.")
+	}
+	return physical, nil
+}

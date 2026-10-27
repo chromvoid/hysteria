@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -219,6 +220,17 @@ func TestDirectResolutionDoesNotAllocateFakeIPs(t *testing.T) {
 	addresses, err = d.resolveDirect(context.Background(), "2001:db8::3")
 	if err != nil || len(addresses) != 1 || calls != 2 {
 		t.Fatal("Numeric address resolution unexpectedly used DNS")
+	}
+	for _, host := range []string{"192.0.2.2", "2001:db8::3"} {
+		addresses, err = d.resolvePhysical(context.Background(), host)
+		if err != nil || len(addresses) == 0 || calls != 2 {
+			t.Fatal("Physical numeric resolution unexpectedly used DNS")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := d.resolvePhysical(ctx, "192.0.2.2"); !errors.Is(err, context.Canceled) {
+		t.Fatal("Physical address resolution ignored cancellation")
 	}
 }
 

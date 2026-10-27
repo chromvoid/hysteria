@@ -286,13 +286,9 @@ func (u *routedUDP) sendDirect(data []byte, original, address string) error {
 		host, port, _ := net.SplitHostPort(address)
 		ctx, cancel := context.WithTimeout(u.ctx, 10*time.Second)
 		defer cancel()
-		addresses := []net.IPAddr{{IP: net.ParseIP(host)}}
-		if addresses[0].IP == nil {
-			var err error
-			addresses, err = u.engine.dns.resolveDirect(ctx, host)
-			if err != nil {
-				return errors.New("Could not resolve the UDP destination.")
-			}
+		addresses, err := u.engine.dns.resolvePhysical(ctx, host)
+		if err != nil {
+			return errors.New("Could not resolve the UDP destination.")
 		}
 		dialer := net.Dialer{Timeout: 10 * time.Second, Control: u.engine.control}
 		gen := u.engine.generation.Load()

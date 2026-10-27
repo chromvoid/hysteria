@@ -122,14 +122,11 @@ func (e *Engine) connect() error {
 	p := e.config.Profile
 	ctx, cancel := context.WithTimeout(e.ctx, 8*time.Second)
 	defer cancel()
-	ip := net.ParseIP(p.Server)
-	if ip == nil {
-		addresses, err := e.dns.resolveDirect(ctx, p.Server)
-		if err != nil || len(addresses) == 0 {
-			return errors.New("Could not resolve the VPN server.")
-		}
-		ip = addresses[0].IP
+	addresses, err := e.dns.resolvePhysical(ctx, p.Server)
+	if err != nil {
+		return errors.New("Could not resolve the VPN server.")
 	}
+	ip := addresses[0].IP
 	var roots *x509.CertPool
 	if p.Certificate != "" {
 		roots = x509.NewCertPool()
@@ -288,12 +285,9 @@ func (e *Engine) directTCP(ctx context.Context, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, errors.New("Invalid destination address.")
 	}
-	addresses := []net.IPAddr{{IP: net.ParseIP(host)}}
-	if addresses[0].IP == nil {
-		addresses, err = e.dns.resolveDirect(ctx, host)
-		if err != nil {
-			return nil, errors.New("Could not resolve the destination.")
-		}
+	addresses, err := e.dns.resolvePhysical(ctx, host)
+	if err != nil {
+		return nil, errors.New("Could not resolve the destination.")
 	}
 	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: e.control}
 	for _, address := range addresses {
