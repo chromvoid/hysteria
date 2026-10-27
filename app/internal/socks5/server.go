@@ -10,7 +10,7 @@ import (
 	"github.com/apernet/hysteria/core/v2/client"
 )
 
-const udpBufferSize = 4096
+const udpBufferSize = 65535
 
 // Server is a SOCKS5 server using a Hysteria client as outbound.
 type Server struct {

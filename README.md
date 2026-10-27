@@ -1,3 +1,13 @@
+# Wayveil Hysteria mobile fork
+
+This fork targets the Wayveil iOS and Android clients. It retains the upstream MIT Hysteria2 transport and SOCKS5 adapter, adds a mobile API, and replaces the GPL-dependent packet path with native HEV Socks5 Tunnel (MIT/BSD). The mobile applications own the VPN interface, HEV lifecycle and OS routes.
+
+The upstream standalone CLI TUN implementation is removed; configuring `tun` in the CLI fails explicitly. Other upstream transport/server code is retained. Existing Wayveil profile formats and ALL/RUSSIAN_DIRECT policies are supported by the mobile integration. Source and third-party notices must remain available with distributions.
+
+Based on upstream `app/v2.13.0`, commit `ca8fbd874fd6ca82413948de6dc5924405e103e1`. See `LICENSE.md`, `app/LICENSE.md`, `core/LICENSE.md` and `extras/LICENSE.md` for original MIT notices.
+
+---
+
 # ![Hysteria 2](logo.svg)
 
 [![License][1]][2] [![Release][3]][4] [![Telegram][5]][6] [![Discussions][7]][8]

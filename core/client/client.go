@@ -43,13 +43,18 @@ type HandshakeInfo struct {
 }
 
 func NewClient(config *Config) (Client, *HandshakeInfo, error) {
+	return NewClientContext(context.Background(), config)
+}
+
+// NewClientContext bounds connection and authentication without limiting its lifetime.
+func NewClientContext(ctx context.Context, config *Config) (Client, *HandshakeInfo, error) {
 	if err := config.verifyAndFill(); err != nil {
 		return nil, nil, err
 	}
 	c := &clientImpl{
 		config: config,
 	}
-	info, err := c.connect()
+	info, err := c.connect(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -66,7 +71,7 @@ type clientImpl struct {
 	udpSM *udpSessionManager
 }
 
-func (c *clientImpl) connect() (*HandshakeInfo, error) {
+func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 	pktConn, err := c.config.ConnFactory.New(c.config.ServerAddr)
 	if err != nil {
 		return nil, err
@@ -129,7 +134,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		Auth: c.config.Auth,
 		Rx:   c.config.BandwidthConfig.MaxRx,
 	})
-	resp, err := rt.RoundTrip(req)
+	resp, err := rt.RoundTrip(req.WithContext(ctx))
 	if err != nil {
 		if conn != nil {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
@@ -195,8 +200,36 @@ func (c *clientImpl) TCP(addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, wrapIfConnectionClosed(err)
 	}
+	return c.requestTCP(stream, addr)
+}
+
+// TCPContext cancels only this connection attempt, preserving other transport streams.
+func (c *clientImpl) TCPContext(ctx context.Context, addr string) (net.Conn, error) {
+	stream, err := c.conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	wrapped := &utils.QStream{Stream: stream}
+	stop := context.AfterFunc(ctx, func() {
+		wrapped.CancelRead(0)
+		wrapped.CancelWrite(0)
+	})
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = wrapped.SetDeadline(deadline)
+	}
+	conn, err := c.requestTCP(wrapped, addr)
+	if ctx.Err() != nil {
+		_ = wrapped.Close()
+		return nil, ctx.Err()
+	}
+	_ = wrapped.SetDeadline(time.Time{})
+	return conn, err
+}
+
+func (c *clientImpl) requestTCP(stream *utils.QStream, addr string) (net.Conn, error) {
 	// Send request
-	err = protocol.WriteTCPRequest(stream, addr)
+	err := protocol.WriteTCPRequest(stream, addr)
 	if err != nil {
 		_ = stream.Close()
 		return nil, wrapIfConnectionClosed(err)

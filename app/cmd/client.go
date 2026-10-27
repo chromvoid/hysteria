@@ -14,8 +14,6 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +32,6 @@ import (
 	"github.com/apernet/hysteria/app/v2/internal/sockopts"
 	"github.com/apernet/hysteria/app/v2/internal/socks5"
 	"github.com/apernet/hysteria/app/v2/internal/tproxy"
-	"github.com/apernet/hysteria/app/v2/internal/tun"
 	"github.com/apernet/hysteria/app/v2/internal/url"
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/client"
@@ -913,19 +910,9 @@ func runClient(v *viper.Viper) {
 			return clientTCPRedirect(*config.TCPRedirect, c)
 		})
 	}
-	var tunServer *tun.Server
 	if config.TUN != nil {
-		tunServer, err = newTUNServer(*config.TUN, c)
-		if err != nil {
-			_ = c.Close()
-			logger.Fatal("failed to load client config", zap.Error(err))
-		}
-		// The TUN adds routes and rules to the system, remove them on exit
-		defer tunServer.Close()
-		runner.Add("TUN", func() error {
-			logger.Info("TUN listening", zap.String("interface", config.TUN.Name))
-			return tunServer.Serve()
-		})
+		_ = c.Close()
+		logger.Fatal("Standalone TUN mode is unavailable in this mobile fork; use the HEV-backed mobile client")
 	}
 
 	signalChan := make(chan os.Signal, 1)
@@ -945,9 +932,6 @@ func runClient(v *viper.Viper) {
 			logger.Info(r.Msg)
 		} else {
 			// Close these here as Fatal will exit the program without running defer
-			if tunServer != nil {
-				_ = tunServer.Close()
-			}
 			_ = c.Close()
 			if r.Err != nil {
 				logger.Fatal(r.Msg, zap.Error(r.Err))
@@ -1159,89 +1143,6 @@ func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
 	}
 	logger.Info("TCP redirect listening", zap.String("addr", config.Listen))
 	return p.ListenAndServe(laddr)
-}
-
-func newTUNServer(config tunConfig, c client.Client) (*tun.Server, error) {
-	supportedPlatforms := []string{"linux", "darwin", "windows", "android"}
-	if !slices.Contains(supportedPlatforms, runtime.GOOS) {
-		return nil, configError{Field: "tun", Err: fmt.Errorf("TUN is not supported on %s", runtime.GOOS)}
-	}
-	if config.Name == "" {
-		return nil, configError{Field: "tun.name", Err: errors.New("name is empty")}
-	}
-	if config.MTU == 0 {
-		config.MTU = 1500
-	}
-	if config.Timeout <= 0 {
-		config.Timeout = 5 * time.Minute
-	}
-	if config.Address.IPv4 == "" {
-		config.Address.IPv4 = "100.100.100.101/30"
-	}
-	prefix4, err := netip.ParsePrefix(config.Address.IPv4)
-	if err != nil {
-		return nil, configError{Field: "tun.address.ipv4", Err: err}
-	}
-	if config.Address.IPv6 == "" {
-		config.Address.IPv6 = "2001::ffff:ffff:ffff:fff1/126"
-	}
-	prefix6, err := netip.ParsePrefix(config.Address.IPv6)
-	if err != nil {
-		return nil, configError{Field: "tun.address.ipv6", Err: err}
-	}
-	server := &tun.Server{
-		HyClient:     c,
-		EventLogger:  &tunLogger{},
-		Logger:       logger,
-		IfName:       config.Name,
-		MTU:          config.MTU,
-		Timeout:      config.Timeout,
-		Inet4Address: []netip.Prefix{prefix4},
-		Inet6Address: []netip.Prefix{prefix6},
-	}
-	if config.Route != nil {
-		server.AutoRoute = true
-
-		parsePrefixes := func(field string, ss []string) ([]netip.Prefix, error) {
-			var prefixes []netip.Prefix
-			for i, s := range ss {
-				var p netip.Prefix
-				if strings.Contains(s, "/") {
-					var err error
-					p, err = netip.ParsePrefix(s)
-					if err != nil {
-						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
-					}
-				} else {
-					pa, err := netip.ParseAddr(s)
-					if err != nil {
-						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
-					}
-					p = netip.PrefixFrom(pa, pa.BitLen())
-				}
-				prefixes = append(prefixes, p)
-			}
-			return prefixes, nil
-		}
-
-		server.Inet4RouteAddress, err = parsePrefixes("tun.route.ipv4", config.Route.IPv4)
-		if err != nil {
-			return nil, err
-		}
-		server.Inet6RouteAddress, err = parsePrefixes("tun.route.ipv6", config.Route.IPv6)
-		if err != nil {
-			return nil, err
-		}
-		server.Inet4RouteExcludeAddress, err = parsePrefixes("tun.route.ipv4Exclude", config.Route.IPv4Exclude)
-		if err != nil {
-			return nil, err
-		}
-		server.Inet6RouteExcludeAddress, err = parsePrefixes("tun.route.ipv6Exclude", config.Route.IPv6Exclude)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return server, nil
 }
 
 // parseServerAddrString parses server address string.
@@ -1469,32 +1370,6 @@ func (l *tcpRedirectLogger) Error(addr, reqAddr net.Addr, err error) {
 		logger.Debug("TCP redirect closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 	} else {
 		logger.Warn("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
-	}
-}
-
-type tunLogger struct{}
-
-func (l *tunLogger) TCPRequest(addr, reqAddr string) {
-	logger.Debug("TUN TCP request", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
-}
-
-func (l *tunLogger) TCPError(addr, reqAddr string, err error) {
-	if err == nil {
-		logger.Debug("TUN TCP closed", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
-	} else {
-		logger.Warn("TUN TCP error", zap.String("addr", addr), zap.String("reqAddr", reqAddr), zap.Error(err))
-	}
-}
-
-func (l *tunLogger) UDPRequest(addr string) {
-	logger.Debug("TUN UDP request", zap.String("addr", addr))
-}
-
-func (l *tunLogger) UDPError(addr string, err error) {
-	if err == nil {
-		logger.Debug("TUN UDP closed", zap.String("addr", addr))
-	} else {
-		logger.Warn("TUN UDP error", zap.String("addr", addr), zap.Error(err))
 	}
 }
 

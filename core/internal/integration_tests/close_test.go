@@ -1,7 +1,9 @@
 package integration_tests
 
 import (
+	"context"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +16,96 @@ import (
 	"github.com/apernet/hysteria/core/v2/internal/integration_tests/mocks"
 	"github.com/apernet/hysteria/core/v2/server"
 )
+
+func TestTCPContextCancellationPreservesOtherStreams(t *testing.T) {
+	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blackhole.Close()
+	deadline, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer stop()
+	started := time.Now()
+	_, _, err = client.NewClientContext(deadline, &client.Config{ServerAddr: blackhole.LocalAddr(), TLSConfig: client.TLSConfig{InsecureSkipVerify: true}})
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), time.Second)
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo := &tcpEchoServer{Listener: listener}
+	defer echo.Close()
+	go echo.Serve()
+	blocked, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	outbound := mocks.NewMockOutbound(t)
+	outbound.EXPECT().TCP("waiting.test:443").RunAndReturn(func(string) (net.Conn, error) {
+		close(blocked)
+		<-release
+		return nil, io.EOF
+	}).Once()
+	outbound.EXPECT().TCP(listener.Addr().String()).RunAndReturn(func(address string) (net.Conn, error) {
+		return net.DialTimeout("tcp", address, time.Second)
+	}).Once()
+	auth := mocks.NewMockAuthenticator(t)
+	auth.EXPECT().Authenticate(mock.Anything, mock.Anything, mock.Anything).Return(true, "test")
+	s, err := server.NewServer(&server.Config{TLSConfig: serverTLSConfig(), Conn: packet, Outbound: outbound, Authenticator: auth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	go s.Serve()
+	connecting, connected := context.WithTimeout(context.Background(), 2*time.Second)
+	c, _, err := client.NewClientContext(connecting, &client.Config{ServerAddr: packet.LocalAddr(), TLSConfig: client.TLSConfig{InsecureSkipVerify: true}})
+	connected()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	dialer := c.(interface {
+		TCPContext(context.Context, string) (net.Conn, error)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() {
+		conn, err := dialer.TCPContext(ctx, "waiting.test:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		finished <- err
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("The server did not receive the pending stream")
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Canceling a stream did not stop its connection attempt")
+	}
+	ctx, done := context.WithTimeout(context.Background(), 2*time.Second)
+	defer done()
+	conn, err := dialer.TCPContext(ctx, listener.Addr().String())
+	if err != nil {
+		t.Fatal("Canceling one stream closed the shared transport")
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(time.Second))
+	_, err = conn.Write([]byte("alive"))
+	assert.NoError(t, err)
+	buffer := make([]byte, 5)
+	_, err = io.ReadFull(conn, buffer)
+	assert.NoError(t, err)
+	assert.Equal(t, "alive", string(buffer))
+}
 
 // TestClientServerTCPClose tests whether the client/server propagates the close of a connection correctly.
 // Closing one side of the connection should close the other side as well.
