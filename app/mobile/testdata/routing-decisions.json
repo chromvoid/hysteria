@@ -1,0 +1,175 @@
+[
+  {
+    "name": "domains-and-priority",
+    "rules": {
+      "proxy_suffix": [
+        "news.example.ru"
+      ],
+      "direct_suffix": [
+        "ru",
+        "vk.com",
+        "bank.example"
+      ],
+      "direct_domain": [
+        "exact.example"
+      ]
+    },
+    "cases": [
+      {
+        "host": "example.ru",
+        "expected": "direct"
+      },
+      {
+        "host": "news.example.ru",
+        "expected": "proxy"
+      },
+      {
+        "host": "m.news.example.ru",
+        "expected": "proxy"
+      },
+      {
+        "host": "notnews.example.ru",
+        "expected": "direct"
+      },
+      {
+        "host": "vk.com",
+        "expected": "direct"
+      },
+      {
+        "host": "m.vk.com",
+        "expected": "direct"
+      },
+      {
+        "host": "notvk.com",
+        "expected": "proxy"
+      },
+      {
+        "host": "vk.com.evil",
+        "expected": "proxy"
+      },
+      {
+        "host": "exact.example",
+        "expected": "direct"
+      },
+      {
+        "host": "m.exact.example",
+        "expected": "proxy"
+      },
+      {
+        "host": "exact.example.evil",
+        "expected": "proxy"
+      },
+      {
+        "host": "VK.COM",
+        "expected": "direct"
+      },
+      {
+        "host": "M.VK.COM.",
+        "expected": "direct"
+      },
+      {
+        "host": "EXACT.EXAMPLE.",
+        "expected": "direct"
+      },
+      {
+        "host": "NEWS.EXAMPLE.RU.",
+        "expected": "proxy"
+      },
+      {
+        "host": "bank.example",
+        "expected": "direct"
+      },
+      {
+        "host": "m.bank.example",
+        "expected": "direct"
+      },
+      {
+        "host": "unlisted.example",
+        "expected": "proxy"
+      }
+    ]
+  },
+  {
+    "name": "proxy-overrides-exact-and-suffix",
+    "rules": {
+      "proxy_suffix": [
+        "vk.com",
+        "exact.example"
+      ],
+      "direct_suffix": [
+        "vk.com"
+      ],
+      "direct_domain": [
+        "exact.example"
+      ]
+    },
+    "cases": [
+      {
+        "host": "vk.com",
+        "expected": "proxy"
+      },
+      {
+        "host": "m.vk.com",
+        "expected": "proxy"
+      },
+      {
+        "host": "exact.example",
+        "expected": "proxy"
+      },
+      {
+        "host": "m.exact.example",
+        "expected": "proxy"
+      }
+    ]
+  },
+  {
+    "name": "addresses",
+    "rules": {
+      "proxy_suffix": [],
+      "direct_suffix": [],
+      "direct_domain": []
+    },
+    "cases": [
+      {
+        "host": "10.1.2.3",
+        "expected": "direct"
+      },
+      {
+        "host": "172.16.2.3",
+        "expected": "direct"
+      },
+      {
+        "host": "192.168.1.2",
+        "expected": "direct"
+      },
+      {
+        "host": "127.0.0.1",
+        "expected": "direct"
+      },
+      {
+        "host": "169.254.1.2",
+        "expected": "direct"
+      },
+      {
+        "host": "fd00::1",
+        "expected": "direct"
+      },
+      {
+        "host": "::1",
+        "expected": "direct"
+      },
+      {
+        "host": "fe80::1",
+        "expected": "direct"
+      },
+      {
+        "host": "8.8.8.8",
+        "expected": "proxy"
+      },
+      {
+        "host": "2001:4860:4860::8888",
+        "expected": "proxy"
+      }
+    ]
+  }
+]

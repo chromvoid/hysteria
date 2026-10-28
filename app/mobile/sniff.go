@@ -58,7 +58,7 @@ func (u *routedUDP) sniffUDP(data []byte, original, address string) error {
 	complete, _ := classifier.UDP(state.packets, &request)
 	if complete || state.bytes >= 65536 {
 		host, _, _ := net.SplitHostPort(request)
-		return u.flushSniff(original, address, russianDomain(host))
+		return u.flushSniff(original, address, u.engine.config.Rules.direct(host))
 	}
 	return nil
 }

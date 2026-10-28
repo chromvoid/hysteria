@@ -39,14 +39,24 @@ type profile struct {
 }
 
 type mobileConfig struct {
-	Profile profile `json:"profile"`
-	Routing string  `json:"routing"`
+	Profile profile       `json:"profile"`
+	Routing string        `json:"routing"`
+	Rules   *routingRules `json:"rules"`
 }
 
 func parseConfig(text string) (mobileConfig, error) {
 	var c mobileConfig
-	if len(text) > 131072 || json.Unmarshal([]byte(text), &c) != nil {
+	if len(text) > 262144 {
 		return c, errors.New("Invalid VPN configuration.")
+	}
+	if err := json.Unmarshal([]byte(text), &c); err != nil {
+		if errors.Is(err, errInvalidRoutingRules) {
+			return c, errInvalidRoutingRules
+		}
+		return c, errors.New("Invalid VPN configuration.")
+	}
+	if err := c.Rules.compile(); err != nil {
+		return c, err
 	}
 	p := &c.Profile
 	if p.Version != 1 || p.Server == "" || strings.ContainsAny(p.Server, "/\\\r\n\t ") || p.Port < 1 || p.Port > 65535 || p.Password == "" ||

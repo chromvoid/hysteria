@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -46,16 +47,16 @@ func dnsAnswer(t *testing.T, wire []byte) *dns.Msg {
 }
 
 func TestDomainRoutingAndFakeDNS(t *testing.T) {
+	e := newTestEngine(t, "RUSSIAN_DIRECT")
 	for host, expected := range map[string]bool{
 		"ru": true, "Example.RU.": true, "a.b.yandex.net": true, "a.xn--p1ai": true,
 		"notru": false, "example.ru.evil": false, "notyandex.net": false, "example.com": false,
 	} {
-		if russianDomain(host) != expected {
+		if e.config.Rules.direct(host) != expected {
 			t.Fatalf("Unexpected routing for %q", host)
 		}
 	}
-	d := newDNSResolver(&Engine{config: mobileConfig{Routing: "RUSSIAN_DIRECT"}})
-	defer d.close()
+	d := e.dns
 	for _, kind := range []uint16{dns.TypeA, dns.TypeAAAA} {
 		query := dnsQuery(t, "Example.RU.", kind)
 		wire, err := d.exchange(context.Background(), query)
@@ -89,6 +90,117 @@ func TestDomainRoutingAndFakeDNS(t *testing.T) {
 	}
 	if len(dnsAnswer(t, wire).Answer) != 0 {
 		t.Fatal("HTTPS hints must not bypass the fake address policy")
+	}
+}
+
+func TestConfiguredDNSRoutingInBothModes(t *testing.T) {
+	for _, mode := range []string{"ALL", "RUSSIAN_DIRECT"} {
+		for _, tc := range []struct {
+			name  string
+			host  string
+			rules routingRules
+			fake  bool
+		}{
+			{"suffix", "bank.example", routingRules{DirectSuffix: []string{"bank.example"}}, true},
+			{"exact", "bank.example", routingRules{DirectDomain: []string{"bank.example"}}, true},
+			{"empty", "bank.example", routingRules{}, false},
+			{"proxy-only", "bank.example", routingRules{ProxySuffix: []string{"bank.example"}}, false},
+			{"proxy-in-suffix", "news.bank.example", routingRules{ProxySuffix: []string{"news.bank.example"}, DirectSuffix: []string{"bank.example"}}, false},
+			{"proxy-over-exact", "bank.example", routingRules{ProxySuffix: []string{"bank.example"}, DirectDomain: []string{"bank.example"}}, false},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				e := newTestEngine(t, mode)
+				if err := tc.rules.compile(); err != nil {
+					t.Fatal(err)
+				}
+				e.config.Rules = &tc.rules
+				calls := 0
+				e.dns.remote.Transport = dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+					calls++
+					wire, err := io.ReadAll(request.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					response := new(dns.Msg)
+					response.SetReply(dnsAnswer(t, wire))
+					response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: tc.host + ".", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("192.0.2.1")}}
+					answer, err := response.Pack()
+					if err != nil {
+						t.Fatal(err)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(answer)), Header: make(http.Header)}, nil
+				})
+				wire, err := e.dns.exchange(e.ctx, dnsQuery(t, tc.host+".", dns.TypeA))
+				if err != nil {
+					t.Fatal(err)
+				}
+				response := dnsAnswer(t, wire)
+				if len(response.Answer) != 1 {
+					t.Fatal("Expected one DNS address")
+				}
+				address := response.Answer[0].(*dns.A).A.String()
+				if fakeIPv4.Contains(mustAddr(t, address)) != tc.fake || (calls == 0) != tc.fake {
+					t.Fatalf("Unexpected DNS route: address=%s, remote calls=%d, want fake=%v", address, calls, tc.fake)
+				}
+			})
+		}
+	}
+}
+
+func TestSharedRoutingDecisions(t *testing.T) {
+	wire, err := os.ReadFile("testdata/routing-decisions.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures []struct {
+		Name  string
+		Rules routingRules
+		Cases []struct{ Host, Expected string }
+	}
+	if err := json.Unmarshal(wire, &fixtures); err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.Name, func(t *testing.T) {
+			if err := fixture.Rules.compile(); err != nil {
+				t.Fatal(err)
+			}
+			for _, tc := range fixture.Cases {
+				got := "proxy"
+				if fixture.Rules.direct(tc.Host) {
+					got = "direct"
+				}
+				if got != tc.Expected {
+					t.Errorf("Route for %q = %s, want %s", tc.Host, got, tc.Expected)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkRoutingDecision4000(b *testing.B) {
+	rules := &routingRules{DirectDomain: []string{"exact.example"}}
+	for i := 0; i < 2000; i++ {
+		rules.DirectSuffix = append(rules.DirectSuffix, fmt.Sprintf("site%d.example", i))
+	}
+	for i := 0; i < 1999; i++ {
+		rules.ProxySuffix = append(rules.ProxySuffix, fmt.Sprintf("blocked%d.example", i))
+	}
+	if err := rules.compile(); err != nil {
+		b.Fatal(err)
+	}
+	for _, tc := range []struct {
+		host   string
+		direct bool
+	}{{"m.site1999.example", true}, {"m.blocked1998.example", false}, {"exact.example", true}, {"unlisted.example", false}} {
+		b.Run(tc.host, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if rules.direct(tc.host) != tc.direct {
+					b.Fatal("Unexpected route")
+				}
+			}
+		})
 	}
 }
 
@@ -139,8 +251,7 @@ func TestFakeDNSCapacityAndExpiry(t *testing.T) {
 }
 
 func TestDNSForwardingAndResponseValidation(t *testing.T) {
-	d := newDNSResolver(&Engine{config: mobileConfig{Routing: "ALL"}})
-	defer d.close()
+	d := newTestEngine(t, "ALL").dns
 	query := dnsQuery(t, "example.com.", dns.TypeA)
 	question := dnsAnswer(t, query)
 	response := new(dns.Msg)
@@ -187,8 +298,7 @@ func TestDNSForwardingAndResponseValidation(t *testing.T) {
 }
 
 func TestDirectResolutionDoesNotAllocateFakeIPs(t *testing.T) {
-	d := newDNSResolver(&Engine{config: mobileConfig{Routing: "RUSSIAN_DIRECT"}})
-	defer d.close()
+	d := newTestEngine(t, "RUSSIAN_DIRECT").dns
 	calls := 0
 	d.direct.Transport = dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		calls++
@@ -244,7 +354,7 @@ func mustAddr(t *testing.T, value string) netip.Addr {
 }
 
 func TestConfigValidationDoesNotExposeCredentials(t *testing.T) {
-	valid := mobileConfig{Profile: profile{Version: 1, Name: "Example", Server: "vpn.example", Port: 443, Password: "private-password-token", ServerName: "vpn.example"}, Routing: "ALL"}
+	valid := mobileConfig{Profile: profile{Version: 1, Name: "Example", Server: "vpn.example", Port: 443, Password: "private-password-token", ServerName: "vpn.example"}, Routing: "ALL", Rules: &routingRules{ProxySuffix: []string{}, DirectSuffix: []string{}, DirectDomain: []string{}}}
 	encode := func(value mobileConfig) string {
 		wire, err := json.Marshal(value)
 		if err != nil {
@@ -272,10 +382,125 @@ func TestConfigValidationDoesNotExposeCredentials(t *testing.T) {
 	}
 }
 
+func TestRoutingRulesValidation(t *testing.T) {
+	const base = `{"profile":{"version":1,"server":"vpn.example","server_port":443,"password":"secret"},"routing":"ALL"`
+	config := func(rules string) string {
+		if rules == "" {
+			return base + "}"
+		}
+		return base + `,"rules":` + rules + "}"
+	}
+	check := func(t *testing.T, text string, invalid bool) {
+		t.Helper()
+		err := Validate(text)
+		if (err != nil) != invalid {
+			t.Fatalf("Validate error = %v, want invalid=%v", err, invalid)
+		}
+		if invalid {
+			_, startErr := Start(text, nil)
+			if startErr == nil || startErr.Error() != err.Error() {
+				t.Fatalf("Start error = %v, want %v", startErr, err)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		rules   string
+		invalid bool
+	}{
+		{"missing-rules", "", true},
+		{"null-rules", "null", true},
+		{"empty-rules", "{}", false},
+		{"unknown-field", `{"direct_suffix":[],"unknown":[]}`, true},
+		{"rules-not-object", `[]`, true},
+		{"suffix-not-array", `{"direct_suffix":"bank.example"}`, true},
+		{"null-array", `{"direct_domain":null}`, true},
+		{"non-string-entry", `{"proxy_suffix":[1]}`, true},
+		{"single-label-exact", `{"direct_domain":["ru"]}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) { check(t, config(tc.rules), tc.invalid) })
+	}
+	for _, field := range []string{"proxy_suffix", "direct_suffix"} {
+		for _, name := range []string{"ru", "su", "xn--p1ai", "com", "example"} {
+			t.Run(field+"/"+name, func(t *testing.T) {
+				check(t, config(fmt.Sprintf(`{%q:[%q]}`, field, name)), name == "com" || name == "example")
+			})
+		}
+	}
+	longest := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	for _, tc := range []struct {
+		name    string
+		host    string
+		invalid bool
+	}{
+		{"ascii-labels", "a0-b1.example", false},
+		{"punycode", "xn--e1afmkfd.xn--p1ai", false},
+		{"253-bytes", longest, false},
+		{"254-bytes", longest + "d", true},
+		{"empty", "", true},
+		{"uppercase", "Bank.example", true},
+		{"non-ascii", "пример.рф", true},
+		{"invalid-character", "bank_name.example", true},
+		{"empty-label", "bank..example", true},
+		{"long-label", strings.Repeat("a", 64) + ".example", true},
+		{"leading-hyphen", "-bank.example", true},
+		{"trailing-hyphen", "bank-.example", true},
+		{"leading-dot", ".bank.example", true},
+		{"trailing-dot", "bank.example.", true},
+		{"wildcard", "*.example", true},
+		{"ipv4", "192.0.2.1", true},
+		{"ipv6", "2001:db8::1", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire, err := json.Marshal([]string{tc.host})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check(t, config(`{"direct_suffix":`+string(wire)+`}`), tc.invalid)
+		})
+	}
+	// Count all entries, including duplicates within and across arrays.
+	rules := routingRules{ProxySuffix: []string{}, DirectSuffix: []string{}, DirectDomain: []string{}}
+	for i := 0; i < 4000; i++ {
+		target := []*[]string{&rules.ProxySuffix, &rules.DirectSuffix, &rules.DirectDomain}[i%3]
+		*target = append(*target, "same.example")
+	}
+	for _, count := range []int{4000, 4001} {
+		t.Run(fmt.Sprintf("%d-entries", count), func(t *testing.T) {
+			if count == 4001 {
+				rules.DirectDomain = append(rules.DirectDomain, "same.example")
+			}
+			wire, err := json.Marshal(rules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			check(t, config(string(wire)), count > 4000)
+		})
+	}
+	parsed, err := parseConfig(config(`{"direct_suffix":["bank.example"]}`))
+	if err != nil || len(parsed.Rules.ProxySuffix) != 0 || len(parsed.Rules.DirectDomain) != 0 {
+		t.Fatalf("Omitted arrays must be empty: %v", err)
+	}
+	for _, size := range []int{131073, 262144, 262145} {
+		t.Run(fmt.Sprintf("%d-bytes", size), func(t *testing.T) {
+			text := config("{}")
+			text += strings.Repeat(" ", size-len(text))
+			check(t, text, size > 262144)
+		})
+	}
+}
+
 func newTestEngine(t *testing.T, routing string) *Engine {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{config: mobileConfig{Routing: routing}, ctx: ctx, cancel: cancel, flows: make(map[io.Closer]struct{})}
+	rules := &routingRules{}
+	if routing == "RUSSIAN_DIRECT" {
+		rules.DirectSuffix = []string{"ru", "su", "xn--p1ai", "yandex.net", "yastatic.net", "vk.com", "userapi.com"}
+	}
+	if err := rules.compile(); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{config: mobileConfig{Routing: routing, Rules: rules}, ctx: ctx, cancel: cancel, flows: make(map[io.Closer]struct{})}
 	e.generation.Store(1)
 	e.dns = newDNSResolver(e)
 	t.Cleanup(func() { _ = e.Close() })
@@ -398,6 +623,47 @@ func (c *fragmentedSniffConn) original() []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]byte(nil), c.payload...)
+}
+
+type rejectingPlatform struct{ called chan struct{} }
+
+func (p *rejectingPlatform) ProtectSocket(int64) error {
+	p.called <- struct{}{}
+	return errors.New("Test socket protection rejection.")
+}
+
+func TestALLModeSniffedSNIUsesDirectTCP(t *testing.T) {
+	e := newTestEngine(t, "ALL")
+	e.config.Rules = &routingRules{DirectSuffix: []string{"bank.example"}}
+	if err := e.config.Rules.compile(); err != nil {
+		t.Fatal(err)
+	}
+	platform := &rejectingPlatform{called: make(chan struct{}, 1)}
+	e.platform = platform
+	conn, err := (&routedClient{engine: e}).TCP("192.0.2.1:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	secure := tls.Client(conn, &tls.Config{ServerName: "Bank.Example", MinVersion: tls.VersionTLS12})
+	done := make(chan error, 1)
+	go func() { done <- secure.Handshake() }()
+	// Only directTCP invokes the physical socket protector. Rejecting there
+	// proves SNI selected that path without opening an external connection.
+	select {
+	case <-platform.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Sniffed SNI did not select the direct TCP socket")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("The test protector must stop the physical connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("The rejected direct dial left a blocked TLS client")
+	}
 }
 
 func TestTrafficSniffingPreservesClientBytes(t *testing.T) {

@@ -25,7 +25,6 @@ const (
 	fakeMappingLifetime = 5 * time.Minute
 )
 
-var russianSuffixes = []string{"ru", "su", "xn--p1ai", "yandex.net", "yastatic.net", "vk.com", "userapi.com"}
 var fakeIPv4 = netip.MustParsePrefix("198.18.0.0/15")
 var fakeIPv6 = netip.MustParsePrefix("fc00::/18")
 
@@ -74,23 +73,13 @@ func (d *dnsResolver) close() {
 
 func normalizedDomain(host string) string { return strings.TrimSuffix(strings.ToLower(host), ".") }
 
-func russianDomain(host string) bool {
-	host = normalizedDomain(host)
-	for _, suffix := range russianSuffixes {
-		if host == suffix || strings.HasSuffix(host, "."+suffix) {
-			return true
-		}
-	}
-	return false
-}
-
 func (d *dnsResolver) exchange(ctx context.Context, query []byte) ([]byte, error) {
 	request, err := parseDNSQuery(query)
 	if err != nil {
 		return nil, err
 	}
 	question := request.Question[0]
-	if d.engine.config.Routing == "RUSSIAN_DIRECT" && russianDomain(question.Name) {
+	if d.engine.config.Rules.hasDirect() && d.engine.config.Rules.direct(question.Name) {
 		response := new(dns.Msg)
 		response.SetReply(request)
 		response.RecursionAvailable = true

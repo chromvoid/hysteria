@@ -35,7 +35,7 @@ func (c *routedClient) TCP(addr string) (net.Conn, error) {
 		defer cancel()
 		return e.directTCP(ctx, address)
 	}
-	if e.config.Routing == "RUSSIAN_DIRECT" && net.ParseIP(host) != nil {
+	if e.config.Rules.hasDirect() && net.ParseIP(host) != nil {
 		return e.sniffTCP(address)
 	}
 	return e.proxyTCP(address)
@@ -54,7 +54,7 @@ func (e *Engine) sniffTCP(address string) (net.Conn, error) {
 		payload, host := sniffDestination(peer)
 		var outbound net.Conn
 		var err error
-		if russianDomain(host) {
+		if e.config.Rules.direct(host) {
 			ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
 			outbound, err = e.directTCP(ctx, address)
 			cancel()
@@ -99,12 +99,7 @@ func (e *Engine) destination(host string, port int) (string, bool, error) {
 		}
 		host = domain
 	}
-	direct := e.config.Routing == "RUSSIAN_DIRECT" && russianDomain(host)
-	if ip, err := netip.ParseAddr(host); err == nil {
-		ip = ip.Unmap()
-		direct = ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
-	}
-	return net.JoinHostPort(host, strconv.Itoa(port)), direct, nil
+	return net.JoinHostPort(host, strconv.Itoa(port)), e.config.Rules.direct(host), nil
 }
 
 func (e *Engine) dnsTCP() (net.Conn, error) {
@@ -217,7 +212,7 @@ func (u *routedUDP) Send(data []byte, addr string) error {
 	if direct {
 		return u.sendDirect(data, addr, address)
 	}
-	if u.engine.config.Routing == "RUSSIAN_DIRECT" && net.ParseIP(host) != nil {
+	if u.engine.config.Rules.hasDirect() && net.ParseIP(host) != nil {
 		return u.sniffUDP(data, addr, address)
 	}
 	hy, err := u.proxySession()
