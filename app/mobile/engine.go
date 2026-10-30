@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,6 +98,9 @@ type Engine struct {
 	generation  atomic.Uint64
 	tx          atomic.Int64
 	rx          atomic.Int64
+	proxyTx     atomic.Int64
+	proxyRx     atomic.Int64
+	download    downloadStats
 }
 
 // Start authenticates the Hysteria2 transport and opens a loopback-only endpoint.
@@ -109,6 +114,7 @@ func Start(configJSON string, platform Platform) (*Engine, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{config: c, platform: platform, ctx: ctx, cancel: cancel, flows: make(map[io.Closer]struct{})}
+	e.download.started = time.Now()
 	e.generation.Store(1)
 	e.dns = newDNSResolver(e)
 	if err := e.connect(); err != nil {
@@ -208,6 +214,35 @@ func (e *Engine) Check() error {
 	return nil
 }
 
+// Ping measures a TCP open through the current VPN transport without sending payload.
+func (e *Engine) Ping() (int64, error) {
+	e.mu.RLock()
+	hy, closed := e.hy, e.closed
+	e.mu.RUnlock()
+	if closed {
+		return 0, errors.New("The VPN engine is closed.")
+	}
+	if hy == nil {
+		return 0, errors.New("The VPN transport is not connected.")
+	}
+	dialer, ok := hy.(interface {
+		TCPContext(context.Context, string) (net.Conn, error)
+	})
+	if !ok {
+		return 0, errors.New("The VPN transport does not support cancellation.")
+	}
+	ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
+	defer cancel()
+	started := time.Now()
+	conn, err := dialer.TCPContext(ctx, "1.1.1.1:443")
+	elapsed := time.Since(started)
+	if err != nil {
+		return 0, errors.New("The VPN latency check failed.")
+	}
+	_ = conn.Close()
+	return max(1, int64((elapsed+time.Millisecond-1)/time.Millisecond)), nil
+}
+
 // Reconnect replaces the network transport while keeping HEV's listener address stable.
 func (e *Engine) Reconnect() error {
 	e.reconnectMu.Lock()
@@ -260,7 +295,112 @@ func (e *Engine) Close() error {
 
 func (e *Engine) TxBytes() int64 { return e.tx.Load() }
 func (e *Engine) RxBytes() int64 { return e.rx.Load() }
-func Version() string            { return "Hysteria2 2.13.0 / Wayveil HEV" }
+
+// ProxyTxBytes returns TCP and UDP payload bytes sent through the VPN since Start.
+func (e *Engine) ProxyTxBytes() int64 { return e.proxyTx.Load() }
+
+// ProxyRxBytes returns TCP and UDP payload bytes received through the VPN since Start.
+func (e *Engine) ProxyRxBytes() int64 { return e.proxyRx.Load() }
+
+// DownloadMedianBps returns the histogram midpoint for completed active seconds.
+func (e *Engine) DownloadMedianBps() int64 {
+	e.download.advance(e.download.now())
+	return e.download.median.Load()
+}
+
+// DownloadPeakBps returns the highest VPN payload byte count in a completed active second.
+func (e *Engine) DownloadPeakBps() int64 {
+	e.download.advance(e.download.now())
+	return e.download.peak.Load()
+}
+
+func Version() string { return "Hysteria2 2.13.0 / Wayveil HEV" }
+
+const minimumDownloadBytes = 64 * 1024
+
+// Eight buckets per doubling give a 9.05% step, capped at 2 GB/s.
+var downloadBounds = func() [121]int64 {
+	var bounds [121]int64
+	for i := range bounds {
+		bounds[i] = min(2_000_000_000, int64(minimumDownloadBytes*math.Exp2(float64(i)/8)))
+	}
+	return bounds
+}()
+
+type downloadStats struct {
+	started time.Time
+	clock   func() int64 // Test clock, in elapsed monotonic seconds.
+	second  atomic.Int64
+	readers atomic.Int64
+	bytes   atomic.Int64
+	median  atomic.Int64
+	peak    atomic.Int64
+	mu      sync.Mutex
+	buckets [120]uint64
+	samples uint64
+}
+
+func (d *downloadStats) now() int64 {
+	if d.clock != nil {
+		return d.clock()
+	}
+	return int64(time.Since(d.started) / time.Second)
+}
+
+func (e *Engine) recordProxyRead(n int64) {
+	if n <= 0 {
+		return
+	}
+	e.proxyRx.Add(n)
+	d := &e.download
+	for {
+		d.readers.Add(1)
+		second := d.now()
+		if second <= d.second.Load() {
+			d.bytes.Add(n)
+			d.readers.Add(-1)
+			return
+		}
+		d.readers.Add(-1)
+		d.advance(second)
+	}
+}
+
+func (d *downloadStats) advance(second int64) {
+	if second <= d.second.Load() {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if second <= d.second.Load() {
+		return
+	}
+	// Block new writers, then drain writers that already validated the old second.
+	// No timer or background goroutine is needed to finish an interval.
+	d.second.Store(-1)
+	for d.readers.Load() != 0 {
+		runtime.Gosched()
+	}
+	n := d.bytes.Swap(0)
+	if n >= minimumDownloadBytes {
+		bucket := 0
+		for bucket < len(d.buckets)-1 && n >= downloadBounds[bucket+1] {
+			bucket++
+		}
+		d.buckets[bucket]++
+		d.samples++
+		d.peak.Store(max(d.peak.Load(), n))
+		var count uint64
+		for i, samples := range d.buckets {
+			count += samples
+			if count >= (d.samples+1)/2 {
+				d.median.Store((downloadBounds[i] + downloadBounds[i+1]) / 2)
+				break
+			}
+		}
+	}
+	d.second.Store(second)
+}
 
 func (e *Engine) proxyTCP(addr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
@@ -286,7 +426,12 @@ func (e *Engine) proxyTCPContext(ctx context.Context, addr string) (net.Conn, er
 	if err != nil {
 		return nil, errors.New("The VPN TCP connection failed.")
 	}
-	return e.trackConn(conn, false, gen)
+	tracked, err := e.trackConn(conn, false, gen)
+	if err != nil {
+		return nil, err
+	}
+	tracked.(*trackedConn).proxy = true
+	return tracked, nil
 }
 
 func (e *Engine) directTCP(ctx context.Context, addr string) (net.Conn, error) {
@@ -404,6 +549,7 @@ type trackedConn struct {
 	net.Conn
 	engine *Engine
 	count  bool
+	proxy  bool
 	once   sync.Once
 }
 
@@ -420,12 +566,18 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	if c.count {
 		c.engine.rx.Add(int64(n))
 	}
+	if c.proxy {
+		c.engine.recordProxyRead(int64(n))
+	}
 	return n, err
 }
 func (c *trackedConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
 	if c.count {
 		c.engine.tx.Add(int64(n))
+	}
+	if c.proxy {
+		c.engine.proxyTx.Add(int64(n))
 	}
 	return n, err
 }

@@ -12,13 +12,17 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/miekg/dns"
 )
 
@@ -502,6 +506,7 @@ func newTestEngine(t *testing.T, routing string) *Engine {
 	}
 	e := &Engine{config: mobileConfig{Routing: routing, Rules: rules}, ctx: ctx, cancel: cancel, flows: make(map[io.Closer]struct{})}
 	e.generation.Store(1)
+	e.download.started = time.Now()
 	e.dns = newDNSResolver(e)
 	t.Cleanup(func() { _ = e.Close() })
 	return e
@@ -707,4 +712,368 @@ func TestTrafficSniffingPreservesClientBytes(t *testing.T) {
 			t.Fatal("TLS classifier left a blocked client")
 		}
 	})
+}
+
+type metricsClient struct {
+	tcp func(context.Context, string) (net.Conn, error)
+	udp client.HyUDPConn
+}
+
+func (c *metricsClient) TCP(addr string) (net.Conn, error) {
+	return c.TCPContext(context.Background(), addr)
+}
+func (c *metricsClient) TCPContext(ctx context.Context, addr string) (net.Conn, error) {
+	return c.tcp(ctx, addr)
+}
+func (c *metricsClient) UDP() (client.HyUDPConn, error) { return c.udp, nil }
+func (c *metricsClient) Close() error                   { return nil }
+
+type metricsConn struct {
+	net.Conn
+	closed atomic.Bool
+	reads  atomic.Int64
+	writes atomic.Int64
+}
+
+func (c *metricsConn) Read(b []byte) (int, error) {
+	c.reads.Add(int64(len(b)))
+	return len(b), nil
+}
+func (c *metricsConn) Write(b []byte) (int, error) {
+	c.writes.Add(int64(len(b)))
+	return len(b), nil
+}
+func (c *metricsConn) Close() error { c.closed.Store(true); return nil }
+
+func TestPing(t *testing.T) {
+	e := newTestEngine(t, "ALL")
+	if _, err := e.Ping(); err == nil || err.Error() == "" {
+		t.Fatal("Ping without a transport must return a readable error")
+	}
+	conn := &metricsConn{}
+	e.hy = &metricsClient{tcp: func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr != "1.1.1.1:443" {
+			t.Fatalf("Ping destination = %q", addr)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 5*time.Second || time.Until(deadline) < 4*time.Second {
+			t.Fatal("Ping must use a five-second deadline")
+		}
+		select {
+		case <-time.After(20 * time.Millisecond):
+			return conn, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	milliseconds, err := e.Ping()
+	if err != nil || milliseconds < 20 || milliseconds > 1000 {
+		t.Fatalf("Ping = %d ms, %v; want the delayed TCP open", milliseconds, err)
+	}
+	if !conn.closed.Load() || conn.reads.Load() != 0 || conn.writes.Load() != 0 {
+		t.Fatal("Ping must close its stream without transferring data")
+	}
+	if e.ProxyRxBytes() != 0 || e.ProxyTxBytes() != 0 || e.RxBytes() != 0 || e.TxBytes() != 0 || e.DownloadMedianBps() != 0 || e.DownloadPeakBps() != 0 {
+		t.Fatal("Ping affected traffic or download statistics")
+	}
+	e.hy = &metricsClient{tcp: func(context.Context, string) (net.Conn, error) { return &metricsConn{}, nil }}
+	if milliseconds, err := e.Ping(); err != nil || milliseconds < 1 {
+		t.Fatalf("Immediate Ping = %d ms, %v; want at least 1 ms", milliseconds, err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Ping(); err == nil || err.Error() == "" {
+		t.Fatal("Ping after Close must return a readable error")
+	}
+}
+
+func TestPingCancellation(t *testing.T) {
+	e := newTestEngine(t, "ALL")
+	started := make(chan struct{})
+	e.hy = &metricsClient{tcp: func(ctx context.Context, _ string) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	done := make(chan error, 1)
+	go func() { _, err := e.Ping(); done <- err }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Ping did not start opening a stream")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Close did not cancel Ping")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Ping remained blocked after Close")
+	}
+}
+
+type metricsPacket struct{ net.PacketConn }
+
+func (*metricsPacket) ReadFrom(b []byte) (int, net.Addr, error)  { return len(b), &net.UDPAddr{}, nil }
+func (*metricsPacket) WriteTo(b []byte, _ net.Addr) (int, error) { return len(b), nil }
+
+type metricsUDP struct {
+	received chan udpResult
+	done     chan struct{}
+	once     sync.Once
+}
+
+func (c *metricsUDP) Receive() ([]byte, string, error) {
+	select {
+	case result := <-c.received:
+		return result.data, result.addr, result.err
+	case <-c.done:
+		return nil, "", net.ErrClosed
+	}
+}
+func (*metricsUDP) Send([]byte, string) error { return nil }
+func (c *metricsUDP) Close() error            { c.once.Do(func() { close(c.done) }); return nil }
+
+func TestProxyAndLegacyTrafficAccounting(t *testing.T) {
+	e := newTestEngine(t, "ALL")
+	udp := &metricsUDP{received: make(chan udpResult, 1), done: make(chan struct{})}
+	e.hy = &metricsClient{tcp: func(context.Context, string) (net.Conn, error) { return &metricsConn{}, nil }, udp: udp}
+	proxy, err := e.proxyTCPContext(e.ctx, "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	if _, err := proxy.Read(make([]byte, 13)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proxy.Write(make([]byte, 7)); err != nil {
+		t.Fatal(err)
+	}
+	// Direct sockets contribute payload to the existing totals; accepted local
+	// sockets and proxy TCP streams must not double-count the wire transport.
+	for _, count := range []bool{true, false} {
+		conn, err := e.trackConn(&metricsConn{}, count, e.generation.Load())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Read(make([]byte, 11)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write(make([]byte, 5)); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}
+	packet := &trackedPacket{PacketConn: &metricsPacket{}, engine: e}
+	if _, _, err := packet.ReadFrom(make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := packet.WriteTo(make([]byte, 8), &net.UDPAddr{}); err != nil {
+		t.Fatal(err)
+	}
+	if e.RxBytes() != 27 || e.TxBytes() != 13 || e.ProxyRxBytes() != 13 || e.ProxyTxBytes() != 7 {
+		t.Fatalf("TCP/wire accounting: legacy rx/tx=%d/%d, proxy rx/tx=%d/%d", e.RxBytes(), e.TxBytes(), e.ProxyRxBytes(), e.ProxyTxBytes())
+	}
+	session, err := (&routedClient{engine: e}).UDP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if err := session.Send(make([]byte, 17), "example.com:443"); err != nil {
+		t.Fatal(err)
+	}
+	// Sniffed UDP uses a second send path; it must share the same accounting.
+	if err := session.(*routedUDP).sendClassified(make([]byte, 19), "1.1.1.1:443", "1.1.1.1:443", false); err != nil {
+		t.Fatal(err)
+	}
+	udp.received <- udpResult{data: make([]byte, 23), addr: "example.com:443"}
+	received := make(chan error, 1)
+	go func() { _, _, err := session.Receive(); received <- err }()
+	select {
+	case err := <-received:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Proxy UDP did not deliver its payload")
+	}
+	if e.RxBytes() != 27 || e.TxBytes() != 13 || e.ProxyRxBytes() != 36 || e.ProxyTxBytes() != 43 {
+		t.Fatalf("UDP accounting: legacy rx/tx=%d/%d, proxy rx/tx=%d/%d", e.RxBytes(), e.TxBytes(), e.ProxyRxBytes(), e.ProxyTxBytes())
+	}
+}
+
+type metricsRecordingConn struct {
+	net.Conn
+	rx, tx *atomic.Int64
+}
+
+func (c metricsRecordingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.rx.Add(int64(n))
+	return n, err
+}
+func (c metricsRecordingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.tx.Add(int64(n))
+	return n, err
+}
+
+func TestProxyTrafficIncludesDoH(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wire, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(wire); err != nil {
+			t.Error(err)
+			return
+		}
+		answer := new(dns.Msg)
+		answer.SetReply(query)
+		payload, err := answer.Pack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+	e := newTestEngine(t, "ALL")
+	var rx, tx atomic.Int64
+	e.hy = &metricsClient{tcp: func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr != "1.1.1.1:443" {
+			t.Errorf("DoH destination = %q", addr)
+		}
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		return metricsRecordingConn{Conn: conn, rx: &rx, tx: &tx}, nil
+	}}
+	transport := e.dns.remote.Transport.(*http.Transport)
+	transport.TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	transport.TLSClientConfig.ServerName = server.Listener.Addr().(*net.TCPAddr).IP.String()
+	query := dnsQuery(t, "example.com.", dns.TypeA)
+	if _, err := e.dns.exchange(e.ctx, query); err != nil {
+		t.Fatal(err)
+	}
+	e.dns.close()
+	if e.ProxyRxBytes() != rx.Load() || e.ProxyTxBytes() != tx.Load() || e.ProxyRxBytes() <= int64(len(query)) || e.ProxyTxBytes() <= int64(len(query)) {
+		t.Fatalf("DoH proxy rx/tx=%d/%d, stream rx/tx=%d/%d", e.ProxyRxBytes(), e.ProxyTxBytes(), rx.Load(), tx.Load())
+	}
+	if e.RxBytes() != 0 || e.TxBytes() != 0 {
+		t.Fatal("DoH payload changed legacy wire accounting")
+	}
+}
+
+func BenchmarkProxyReadAccounting(b *testing.B) {
+	var buffer [4096]byte
+	b.Run("baseline", func(b *testing.B) {
+		conn := &metricsConn{}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = conn.Read(buffer[:])
+		}
+	})
+	b.Run("proxy", func(b *testing.B) {
+		e := &Engine{}
+		e.download.started = time.Now()
+		conn := &trackedConn{Conn: &metricsConn{}, engine: e, proxy: true}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = conn.Read(buffer[:])
+		}
+	})
+}
+
+func TestDownloadActiveSeconds(t *testing.T) {
+	e := newTestEngine(t, "ALL")
+	var second int64
+	e.download.clock = func() int64 { return second }
+	if e.DownloadMedianBps() != 0 || e.DownloadPeakBps() != 0 {
+		t.Fatal("An engine without active seconds must report zero speeds")
+	}
+	e.recordProxyRead(64*1024 - 1)
+	second = 100
+	if e.DownloadMedianBps() != 0 || e.DownloadPeakBps() != 0 {
+		t.Fatal("A second below 64 KiB must not affect download statistics")
+	}
+	for _, rate := range []int64{1_000_000, 2_000_000, 2_000_000, 3_000_000, 100_000_000} {
+		e.recordProxyRead(rate)
+		second++
+	}
+	median, peak := e.DownloadMedianBps(), e.DownloadPeakBps()
+	if median < 1_800_000 || median > 2_200_000 || peak != 100_000_000 {
+		t.Fatalf("Download median/peak = %d/%d B/s, want approximately 2000000/100000000", median, peak)
+	}
+	second += 10000
+	e.recordProxyRead(1)
+	second++
+	if e.DownloadMedianBps() != median || e.DownloadPeakBps() != peak {
+		t.Fatal("Idle gaps and inactive seconds changed download statistics")
+	}
+	t.Run("threshold", func(t *testing.T) {
+		e := newTestEngine(t, "ALL")
+		var second int64
+		e.download.clock = func() int64 { return second }
+		e.recordProxyRead(64 * 1024)
+		second++
+		median := e.DownloadMedianBps()
+		if median < 64*1024 || median > 64*1024*11/10 || e.DownloadPeakBps() != 64*1024 {
+			t.Fatalf("Threshold median/peak = %d/%d B/s", median, e.DownloadPeakBps())
+		}
+	})
+	t.Run("overflow-bin", func(t *testing.T) {
+		e := newTestEngine(t, "ALL")
+		var second int64
+		e.download.clock = func() int64 { return second }
+		e.recordProxyRead(3_000_000_000)
+		second++
+		median := e.DownloadMedianBps()
+		if median < 1_800_000_000 || median > 2_000_000_000 || e.DownloadPeakBps() != 3_000_000_000 {
+			t.Fatalf("Overflow median/peak = %d/%d B/s", median, e.DownloadPeakBps())
+		}
+	})
+}
+
+func TestConcurrentProxyReadAccounting(t *testing.T) {
+	e := newTestEngine(t, "ALL")
+	var second atomic.Int64
+	e.download.clock = second.Load
+	const streams, reads, bytes = 8, 1000, 4096
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			conn := &trackedConn{Conn: &metricsConn{}, engine: e, proxy: true}
+			var buffer [bytes]byte
+			for i := 0; i < reads; i++ {
+				_, _ = conn.Read(buffer[:])
+			}
+		}()
+	}
+	close(start)
+	for i := 0; i < 100; i++ {
+		second.Add(1)
+		_ = e.DownloadMedianBps()
+		_ = e.DownloadPeakBps()
+		runtime.Gosched()
+	}
+	workers.Wait()
+	second.Add(1)
+	if e.ProxyRxBytes() != streams*reads*bytes {
+		t.Fatalf("Parallel proxy reads = %d bytes, want %d", e.ProxyRxBytes(), streams*reads*bytes)
+	}
+	if e.DownloadMedianBps() == 0 || e.DownloadPeakBps() < 64*1024 {
+		t.Fatal("Parallel active seconds were lost during rollovers")
+	}
 }

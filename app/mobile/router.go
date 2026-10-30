@@ -247,6 +247,7 @@ func (u *routedUDP) proxySession() (client.HyUDPConn, error) {
 	if err != nil {
 		return nil, errors.New("Could not open the VPN UDP session.")
 	}
+	hy = &proxyUDP{HyUDPConn: hy, engine: u.engine}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.closed {
@@ -267,6 +268,25 @@ func (u *routedUDP) proxySession() (client.HyUDPConn, error) {
 		}
 	}()
 	return hy, nil
+}
+
+type proxyUDP struct {
+	client.HyUDPConn
+	engine *Engine
+}
+
+func (u *proxyUDP) Send(data []byte, addr string) error {
+	if err := u.HyUDPConn.Send(data, addr); err != nil {
+		return err
+	}
+	u.engine.proxyTx.Add(int64(len(data)))
+	return nil
+}
+
+func (u *proxyUDP) Receive() ([]byte, string, error) {
+	data, addr, err := u.HyUDPConn.Receive()
+	u.engine.recordProxyRead(int64(len(data)))
+	return data, addr, err
 }
 
 func (u *routedUDP) sendDirect(data []byte, original, address string) error {
