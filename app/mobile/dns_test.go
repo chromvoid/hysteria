@@ -1571,6 +1571,25 @@ func TestXrayTransportEcho(t *testing.T) {
 			}
 		})
 	}
+	t.Run("xhttp-reconnect-release", func(t *testing.T) {
+		if raceEnabled {
+			t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
+		}
+		point, _ := localXrayServer(t, "vless_xhttp", "")
+		e := startTransportEngine(t, []endpoint{point}, "")
+		const reconnects = 200
+		for i := 1; i <= reconnects; i++ {
+			// XUDP exercises mux dialers that do not carry the instance context.
+			assertTransportEcho(t, e, true)
+			if err := e.Reconnect(); err != nil {
+				t.Fatalf("Reconnect %d: %v", i, err)
+			}
+			if size := xhttpDialerCount(); size > 2 {
+				t.Fatalf("After reconnect %d: XHTTP dialer cache = %d, want at most 2", i, size)
+			}
+		}
+		t.Logf("After %d XHTTP reconnects: dialer cache = %d", reconnects, xhttpDialerCount())
+	})
 	t.Run("socket-protection", func(t *testing.T) {
 		listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
@@ -2196,8 +2215,8 @@ func TestNoCopyleftDependencies(t *testing.T) {
 		seen[m.Path] = true
 		check(m.Path)
 		if m.Path == "github.com/xtls/xray-core" && (m.Version != "v1.260327.0" || m.Replace == nil ||
-			m.Replace.Path != "github.com/chromvoid/Xray-core" || m.Replace.Version != "v0.0.0-20261031073143-fa758cf34bed") {
-			t.Fatal("Xray must use the reviewed ChromVoid fork at fa758cf34bedfa9933a64112f9cd1c29ea7a00eb")
+			m.Replace.Path != "github.com/chromvoid/Xray-core" || m.Replace.Version != "v0.0.0-20261031102336-cad524c1b2de") {
+			t.Fatal("Xray must use the reviewed ChromVoid fork at cad524c1b2de40d5b22371e4872609c2e361e371")
 		}
 		if m.Replace != nil {
 			if m.Replace.Version != "" {

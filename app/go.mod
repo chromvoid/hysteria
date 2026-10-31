@@ -100,4 +100,4 @@ tool (
 	github.com/sagernet/gomobile/cmd/gomobile
 )
 
-replace github.com/xtls/xray-core => github.com/chromvoid/Xray-core v0.0.0-20261031073143-fa758cf34bed
+replace github.com/xtls/xray-core => github.com/chromvoid/Xray-core v0.0.0-20261031102336-cad524c1b2de
