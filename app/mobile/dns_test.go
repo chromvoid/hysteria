@@ -1799,6 +1799,79 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 			t.Fatalf("Reconnect must retain the current endpoint before restored first: %q, %v", e.ActiveEndpoint(), err)
 		}
 	})
+	for _, tc := range []struct {
+		name        string
+		ids         []string
+		lastWorking string
+	}{
+		{"reconnect-preferred-after-failure", []string{"first", "second"}, "second"},
+		{"reconnect-last-working-before-preferred-after-failure", []string{"first", "second", "third"}, "third"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			points := make([]endpoint, len(tc.ids))
+			available := make([]atomic.Bool, len(tc.ids))
+			for i, id := range tc.ids {
+				point, _ := localXrayServer(t, "vless_reality", "")
+				backend := net.JoinHostPort(point.Server, fmt.Sprint(point.Port))
+				relay, err := net.Listen("tcp4", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = relay.Close() })
+				ready := &available[i]
+				ready.Store(tc.lastWorking == "second" || id == tc.lastWorking)
+				go func() {
+					for {
+						conn, err := relay.Accept()
+						if err != nil {
+							return
+						}
+						if !ready.Load() {
+							_ = conn.Close()
+							continue
+						}
+						go func() {
+							defer conn.Close()
+							upstream, err := net.DialTimeout("tcp", backend, time.Second)
+							if err != nil {
+								return
+							}
+							defer upstream.Close()
+							go func() { _, _ = io.Copy(upstream, conn) }()
+							_, _ = io.Copy(conn, upstream)
+						}()
+					}
+				}()
+				point.ID, point.Port = id, relay.Addr().(*net.TCPAddr).Port
+				points[i] = point
+			}
+			e := startTransportEngine(t, points, "second")
+			if e.ActiveEndpoint() != tc.lastWorking {
+				t.Fatalf("Initial endpoint = %q, want %s", e.ActiveEndpoint(), tc.lastWorking)
+			}
+			for i := range available {
+				available[i].Store(false)
+			}
+			if err := e.Reconnect(); err == nil {
+				t.Fatal("Reconnect must fail while all endpoints are unavailable")
+			}
+			if e.ActiveEndpoint() != "" {
+				t.Fatalf("Failed reconnect endpoint = %q, want empty", e.ActiveEndpoint())
+			}
+			for i := range available {
+				available[i].Store(true)
+			}
+			if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != tc.lastWorking {
+				t.Fatalf("Reconnect after failure = %q, %v; want %s", e.ActiveEndpoint(), err, tc.lastWorking)
+			}
+			if tc.lastWorking == "third" {
+				available[2].Store(false)
+				if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != "second" {
+					t.Fatalf("Reconnect after the last working endpoint fails = %q, %v; want preferred second", e.ActiveEndpoint(), err)
+				}
+			}
+		})
+	}
 	t.Run("reconnect-next", func(t *testing.T) {
 		first, server := localXrayServer(t, "vless_reality", "")
 		next, _ := localXrayServer(t, "vless_reality", "")
