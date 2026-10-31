@@ -108,6 +108,7 @@ type Engine struct {
 	mu          sync.RWMutex
 	hy          vpnTransport
 	activeID    string
+	lastGoodID  string
 	closed      bool
 	reconnectMu sync.Mutex
 	flowMu      sync.Mutex
@@ -162,7 +163,12 @@ func (e *Engine) connect(first string) error {
 		}
 	}
 	for _, p := range e.config.Endpoints {
-		if p.ID != first {
+		if p.ID == e.config.PreferredEndpoint && p.ID != first {
+			endpoints = append(endpoints, p)
+		}
+	}
+	for _, p := range e.config.Endpoints {
+		if p.ID != first && p.ID != e.config.PreferredEndpoint {
 			endpoints = append(endpoints, p)
 		}
 	}
@@ -194,7 +200,7 @@ func (e *Engine) connect(first string) error {
 			_ = transport.Close()
 			return net.ErrClosed
 		}
-		e.hy, e.activeID = transport, p.ID
+		e.hy, e.activeID, e.lastGoodID = transport, p.ID, p.ID
 		e.mu.Unlock()
 		return nil
 	}
@@ -346,7 +352,7 @@ func (e *Engine) Reconnect() error {
 		return net.ErrClosed
 	}
 	hy := e.hy
-	first := e.activeID
+	first := e.lastGoodID
 	e.hy = nil
 	e.activeID = ""
 	e.generation.Add(1)
