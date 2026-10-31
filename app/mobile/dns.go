@@ -58,6 +58,7 @@ func dohClient(dial func(context.Context, string) (net.Conn, error), serverName 
 	transport := &http.Transport{
 		DialContext:         func(ctx context.Context, _, addr string) (net.Conn, error) { return dial(ctx, addr) },
 		TLSClientConfig:     &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:   true,
 		TLSHandshakeTimeout: 5 * time.Second,
 		DisableCompression:  true,
 		MaxIdleConns:        2,

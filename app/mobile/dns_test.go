@@ -477,6 +477,66 @@ func TestDirectDNSFallback(t *testing.T) {
 	}
 }
 
+func TestDirectDNSUsesHTTP2(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 {
+			http.Error(w, "HTTP/2 required.", http.StatusHTTPVersionNotSupported)
+			return
+		}
+		requests.Add(1)
+		wire, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(wire); err != nil {
+			t.Error(err)
+			return
+		}
+		answer := new(dns.Msg)
+		answer.SetReply(query)
+		question := query.Question[0]
+		header := dns.RR_Header{Name: question.Name, Rrtype: question.Qtype, Class: dns.ClassINET, Ttl: 60}
+		if question.Qtype == dns.TypeA {
+			answer.Answer = []dns.RR{&dns.A{Hdr: header, A: net.ParseIP("192.0.2.2")}}
+		} else {
+			answer.Answer = []dns.RR{&dns.AAAA{Hdr: header, AAAA: net.ParseIP("2001:db8::2")}}
+		}
+		payload, err := answer.Pack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(payload)
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	d := newTestEngine(t, "RUSSIAN_DIRECT").dns
+	transport := d.direct.Transport.(*http.Transport)
+	transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+		if addr != "77.88.8.8:443" {
+			t.Errorf("Direct DoH destination = %q", addr)
+			return nil, errors.New("Unexpected direct DoH destination.")
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+	}
+	transport.TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	transport.TLSClientConfig.ServerName = server.Listener.Addr().(*net.TCPAddr).IP.String()
+	d.directFallback.Transport = dnsRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Error("Direct HTTP/2 resolution used Cloudflare")
+		return nil, errors.New("Unexpected Cloudflare request.")
+	})
+	d.remote.Transport = d.directFallback.Transport
+	addresses, err := d.resolveDirect(context.Background(), "example.ru")
+	if err != nil || len(addresses) != 2 || addresses[0].IP.String() != "192.0.2.2" || addresses[1].IP.String() != "2001:db8::2" || requests.Load() != 2 {
+		t.Fatalf("Direct HTTP/2 addresses = %v, error = %v, requests = %d", addresses, err, requests.Load())
+	}
+}
+
 func mustAddr(t *testing.T, value string) netip.Addr {
 	t.Helper()
 	address, err := netip.ParseAddr(value)
