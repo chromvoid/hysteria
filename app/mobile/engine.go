@@ -57,9 +57,6 @@ func parseConfig(text string) (mobileConfig, error) {
 		if errors.Is(err, errInvalidRoutingRules) {
 			return c, errInvalidRoutingRules
 		}
-		if errors.Is(err, errInvalidEndpoint) {
-			return c, err
-		}
 		return c, errors.New("Invalid VPN configuration.")
 	}
 	if err := c.Rules.compile(); err != nil {

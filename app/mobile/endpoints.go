@@ -29,6 +29,7 @@ type endpoint struct {
 	Mux          bool   `json:"mux,omitempty"`
 	Path         string `json:"path,omitempty"`
 	Mode         string `json:"mode,omitempty"`
+	invalid      bool
 }
 
 var errInvalidEndpoint = errors.New("Invalid VPN endpoint configuration")
@@ -38,42 +39,52 @@ func endpointFieldError(field, reason string) error {
 }
 
 func (p *endpoint) UnmarshalJSON(wire []byte) error {
-	type plain endpoint
-	var value plain
-	if err := json.Unmarshal(wire, &value); err != nil {
-		var typeError *json.UnmarshalTypeError
-		if errors.As(err, &typeError) {
-			return endpointFieldError(typeError.Field, "has an invalid type")
-		}
-		return errInvalidEndpoint
-	}
+	*p = endpoint{invalid: true}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(wire, &fields); err != nil || fields == nil {
-		return errInvalidEndpoint
+	if err := json.Unmarshal(wire, &fields); err != nil {
+		var syntaxError *json.SyntaxError
+		if errors.As(err, &syntaxError) {
+			return err
+		}
+		return nil
 	}
-	if value.Kind != "hysteria2" && value.Kind != "vless_reality" && value.Kind != "vless_xhttp" {
-		return endpointFieldError("kind", "must be hysteria2, vless_reality or vless_xhttp")
+	if fields == nil {
+		return nil
+	}
+	var kind string
+	if err := json.Unmarshal(fields["kind"], &kind); err != nil {
+		return nil
 	}
 	for field, valueJSON := range fields {
-		if string(valueJSON) == "null" {
-			return endpointFieldError(field, "must not be null")
-		}
 		allowed := false
 		switch field {
 		case "id", "kind", "server", "server_port", "server_name":
 			allowed = true
 		case "password", "obfs_password", "certificate":
-			allowed = value.Kind == "hysteria2"
+			allowed = kind == "hysteria2"
 		case "uuid", "public_key", "short_id", "fingerprint", "mux":
-			allowed = value.Kind == "vless_reality" || value.Kind == "vless_xhttp"
+			allowed = kind == "vless_reality" || kind == "vless_xhttp"
 		case "flow":
-			allowed = value.Kind == "vless_reality"
+			allowed = kind == "vless_reality"
 		case "path", "mode":
-			allowed = value.Kind == "vless_xhttp"
+			allowed = kind == "vless_xhttp"
+		default:
+			delete(fields, field)
+			continue
 		}
-		if !allowed {
-			return endpointFieldError(field, "is not supported for this endpoint kind")
+		if !allowed || string(valueJSON) == "null" {
+			return nil
 		}
+	}
+	// Decode only known keys; unknown values cannot invalidate this endpoint.
+	knownJSON, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	type plain endpoint
+	var value plain
+	if err := json.Unmarshal(knownJSON, &value); err != nil {
+		return nil
 	}
 	*p = endpoint(value)
 	return nil
@@ -90,45 +101,52 @@ func (c *mobileConfig) validateEndpoints() error {
 		return nil // The legacy profile was already validated by parseConfig.
 	}
 	ids := make(map[string]bool, len(c.Endpoints))
-	for i := range c.Endpoints {
-		p := &c.Endpoints[i]
-		if p.ID == "" {
-			return endpointFieldError("id", "is required")
-		}
-		if ids[p.ID] {
-			return endpointFieldError("id", "must be unique")
+	valid := c.Endpoints[:0]
+	for _, p := range c.Endpoints {
+		if p.invalid || ids[p.ID] || p.validate() != nil {
+			continue
 		}
 		ids[p.ID] = true
-		if p.Server == "" || strings.ContainsAny(p.Server, "/\\\r\n\t ") || (strings.ContainsAny(p.Server, ":[]") && net.ParseIP(p.Server) == nil) {
-			return endpointFieldError("server", "must be a hostname or IP address")
+		valid = append(valid, p)
+	}
+	c.Endpoints = valid
+	if len(c.Endpoints) == 0 {
+		return fmt.Errorf("%w: no supported endpoints remain.", errInvalidEndpoint)
+	}
+	return nil
+}
+
+func (p *endpoint) validate() error {
+	if p.ID == "" {
+		return endpointFieldError("id", "is required")
+	}
+	if p.Server == "" || strings.ContainsAny(p.Server, "/\\\r\n\t ") || (strings.ContainsAny(p.Server, ":[]") && net.ParseIP(p.Server) == nil) {
+		return endpointFieldError("server", "must be a hostname or IP address")
+	}
+	if p.Port < 1 || p.Port > 65535 {
+		return endpointFieldError("server_port", "must be between 1 and 65535")
+	}
+	if strings.ContainsAny(p.ServerName, "/\\\r\n\t ") {
+		return endpointFieldError("server_name", "must be a hostname")
+	}
+	switch p.Kind {
+	case "hysteria2":
+		if p.ServerName == "" {
+			p.ServerName = p.Server
 		}
-		if p.Port < 1 || p.Port > 65535 {
-			return endpointFieldError("server_port", "must be between 1 and 65535")
+		if p.Password == "" {
+			return endpointFieldError("password", "is required")
 		}
-		if strings.ContainsAny(p.ServerName, "/\\\r\n\t ") {
-			return endpointFieldError("server_name", "must be a hostname")
+		if p.ObfsPassword != "" && len(p.ObfsPassword) < 4 {
+			return endpointFieldError("obfs_password", "must contain at least 4 bytes")
 		}
-		switch p.Kind {
-		case "hysteria2":
-			if p.ServerName == "" {
-				p.ServerName = p.Server
-			}
-			if p.Password == "" {
-				return endpointFieldError("password", "is required")
-			}
-			if p.ObfsPassword != "" && len(p.ObfsPassword) < 4 {
-				return endpointFieldError("obfs_password", "must contain at least 4 bytes")
-			}
-			if p.Certificate != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(p.Certificate)) {
-				return endpointFieldError("certificate", "must contain a PEM certificate")
-			}
-		case "vless_reality", "vless_xhttp":
-			if err := p.validateVLESS(); err != nil {
-				return err
-			}
-		default:
-			return endpointFieldError("kind", "must be hysteria2, vless_reality or vless_xhttp")
+		if p.Certificate != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(p.Certificate)) {
+			return endpointFieldError("certificate", "must contain a PEM certificate")
 		}
+	case "vless_reality", "vless_xhttp":
+		return p.validateVLESS()
+	default:
+		return endpointFieldError("kind", "must be hysteria2, vless_reality or vless_xhttp")
 	}
 	return nil
 }
@@ -158,12 +176,12 @@ func (p *endpoint) validateVLESS() error {
 	default:
 		return endpointFieldError("fingerprint", "is not supported")
 	}
-	if p.Mux {
-		return endpointFieldError("mux", "must be false")
-	}
 	if p.Kind == "vless_reality" {
 		if p.Flow != "" && p.Flow != "xtls-rprx-vision" {
 			return endpointFieldError("flow", "must be empty or xtls-rprx-vision")
+		}
+		if p.Flow == "xtls-rprx-vision" && p.Mux {
+			return endpointFieldError("mux", "cannot be enabled with xtls-rprx-vision")
 		}
 	} else {
 		if p.Path == "" || !strings.HasPrefix(p.Path, "/") || strings.ContainsAny(p.Path, "\r\n\t ?#") {

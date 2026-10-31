@@ -1508,7 +1508,13 @@ func assertTransportEcho(t *testing.T, e *Engine, sharedHTTP2 bool) {
 	case <-ctx.Done():
 		t.Fatal("UDP echo timed out")
 	}
-	if _, xray := e.hy.(*xrayTransport); xray && !sharedHTTP2 && platform.protected.Load() <= protectedBefore {
+	activeMux := false
+	for _, point := range e.config.Endpoints {
+		if point.ID == e.ActiveEndpoint() {
+			activeMux = point.Mux
+		}
+	}
+	if _, xray := e.hy.(*xrayTransport); xray && !sharedHTTP2 && !activeMux && platform.protected.Load() <= protectedBefore {
 		t.Fatal("The XUDP physical socket bypassed platform protection")
 	}
 	if e.TxBytes() <= txBefore || e.RxBytes() <= rxBefore {
@@ -1518,9 +1524,24 @@ func assertTransportEcho(t *testing.T, e *Engine, sharedHTTP2 bool) {
 
 func TestXrayTransportEcho(t *testing.T) {
 	localTransportProbe(t)
-	for _, tc := range []struct{ kind, flow string }{{"vless_reality", ""}, {"vless_reality", "xtls-rprx-vision"}, {"vless_xhttp", ""}} {
-		t.Run(tc.kind+"/"+tc.flow, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, flow string
+		mux              bool
+	}{
+		{"reality", "vless_reality", "", false},
+		{"vision", "vless_reality", "xtls-rprx-vision", false},
+		{"xhttp", "vless_xhttp", "", false},
+		{"reality-mux", "vless_reality", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if raceEnabled && tc.flow == "xtls-rprx-vision" {
+				t.Skip("Upstream Xray Vision uses uintptr pointer arithmetic that fails checkptr under -race (proxy/vless/outbound/outbound.go).")
+			}
+			if raceEnabled && tc.kind == "vless_xhttp" {
+				t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
+			}
 			point, _ := localXrayServer(t, tc.kind, tc.flow)
+			point.Mux = tc.mux
 			platform := &transportTestPlatform{}
 			e, err := Start(transportConfigJSON(t, []endpoint{point}, ""), platform)
 			if err != nil {
@@ -1705,7 +1726,6 @@ func TestEndpointValidation(t *testing.T) {
 		name   string
 		change func(*endpoint)
 	}{
-		{"kind", func(p *endpoint) { p.Kind = "unknown" }},
 		{"id", func(p *endpoint) { p.ID = "" }},
 		{"server", func(p *endpoint) { p.Server = "bad host" }},
 		{"port", func(p *endpoint) { p.Port = 65536 }},
@@ -1715,7 +1735,7 @@ func TestEndpointValidation(t *testing.T) {
 		{"short-id-long", func(p *endpoint) { p.ShortID = strings.Repeat("a", 18) }},
 		{"short-id-hex", func(p *endpoint) { p.ShortID = "gg" }},
 		{"fingerprint", func(p *endpoint) { p.Fingerprint = "unknown" }},
-		{"mux", func(p *endpoint) { p.Mux = true }},
+		{"vision-mux", func(p *endpoint) { p.Flow, p.Mux = "xtls-rprx-vision", true }},
 		{"flow", func(p *endpoint) { p.Flow = "unsupported" }},
 		{"xhttp-flow", func(p *endpoint) {
 			p.Kind, p.Path, p.Mode, p.Flow = "vless_xhttp", "/xhttp", "auto", "xtls-rprx-vision"
@@ -1729,15 +1749,50 @@ func TestEndpointValidation(t *testing.T) {
 			if err == nil || strings.Contains(err.Error(), "private-invalid") {
 				t.Fatalf("Endpoint validation = %v", err)
 			}
+			parsed, err := parseConfig(transportConfigJSON(t, []endpoint{point, valid}, "stale-endpoint"))
+			if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].ID != valid.ID {
+				t.Fatalf("Invalid endpoint must be dropped beside a valid endpoint: %+v, %v", parsed.Endpoints, err)
+			}
 		})
 	}
-	if err := Validate(transportConfigJSON(t, []endpoint{valid, valid}, "")); err == nil {
-		t.Fatal("Duplicate endpoint IDs were accepted")
-	}
-	for _, field := range []string{`"unknown":true`, `"mux":"false"`, `"flow":null`} {
+	t.Run("unknown-kind-beside-valid", func(t *testing.T) {
+		unknown := valid
+		unknown.ID, unknown.Kind = "future", "future-transport"
+		parsed, err := parseConfig(transportConfigJSON(t, []endpoint{unknown, valid}, unknown.ID))
+		if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].ID != valid.ID {
+			t.Fatalf("An unknown endpoint kind must be filtered: %+v, %v", parsed.Endpoints, err)
+		}
+	})
+	t.Run("unknown-field-ignored", func(t *testing.T) {
+		wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality","future_option":{"nested":null}`, 1)
+		if err := Validate(wire); err != nil {
+			t.Fatalf("Unknown endpoint fields must be ignored: %v", err)
+		}
+	})
+	t.Run("all-invalid", func(t *testing.T) {
+		unknown, invalid := valid, valid
+		unknown.Kind, invalid.Port = "future-transport", 0
+		if err := Validate(transportConfigJSON(t, []endpoint{unknown, invalid}, "")); err == nil {
+			t.Fatal("A nonempty list without a valid endpoint was accepted")
+		}
+	})
+	t.Run("duplicate-id", func(t *testing.T) {
+		duplicate := valid
+		duplicate.Port++
+		parsed, err := parseConfig(transportConfigJSON(t, []endpoint{valid, duplicate}, ""))
+		if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].Port != valid.Port {
+			t.Fatalf("The first valid endpoint ID must be retained: %+v, %v", parsed.Endpoints, err)
+		}
+	})
+	for _, field := range []string{`"mux":"false"`, `"flow":null`} {
 		wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality",`+field, 1)
 		if err := Validate(wire); err == nil {
 			t.Fatalf("Invalid endpoint field accepted: %s", field)
+		}
+		wire = strings.Replace(transportConfigJSON(t, []endpoint{valid, valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality",`+field, 1)
+		parsed, err := parseConfig(wire)
+		if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].ID != valid.ID {
+			t.Fatalf("An invalid field must not discard valid siblings: %+v, %v", parsed.Endpoints, err)
 		}
 	}
 	for _, fingerprint := range []string{"", "chrome", "firefox", "safari", "edge", "ios", "android", "random", "randomized"} {
@@ -1753,6 +1808,11 @@ func TestEndpointValidation(t *testing.T) {
 		if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
 			t.Fatalf("XHTTP mode %q rejected: %v", mode, err)
 		}
+	}
+	point := valid
+	point.Mux = true
+	if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
+		t.Fatalf("REALITY without Vision must accept mux: %v", err)
 	}
 	parsed, err := parseConfig(transportConfigJSON(t, []endpoint{valid}, ""))
 	if err != nil || parsed.Endpoints[0].Fingerprint != "firefox" {

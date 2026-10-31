@@ -28,6 +28,7 @@ require (
 	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
+	google.golang.org/protobuf v1.36.11
 )
 
 require (
@@ -86,7 +87,6 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
 	google.golang.org/grpc v1.79.3 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )

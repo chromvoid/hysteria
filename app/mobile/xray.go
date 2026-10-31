@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/tcp"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 type xrayOwnerKey struct{}
@@ -40,17 +42,21 @@ type xrayOwner struct {
 }
 
 type xrayTransport struct {
-	engine   *Engine
-	instance *core.Instance
-	ctx      context.Context
-	cancel   context.CancelFunc
-	server   xnet.Destination
-	ping     *internet.MemoryStreamConfig
+	engine     *Engine
+	instance   *core.Instance
+	ctx        context.Context
+	cancel     context.CancelFunc
+	server     xnet.Destination
+	ping       *internet.MemoryStreamConfig
+	ownerToken uint64
 }
+
+const xraySocketOwnerField protowire.Number = 50000
 
 var xrayDialerOnce sync.Once
 var xrayDialerError error
-var xraySocketOwners sync.Map // *internet.SocketConfig -> *xrayTransport
+var xrayOwnerCounter atomic.Uint64
+var xraySocketOwners sync.Map // uint64 -> *xrayTransport
 
 func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
 	addresses, err := e.dns.resolvePhysical(ctx, p.Server)
@@ -81,23 +87,30 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 	if err != nil {
 		return nil, errors.New("Could not configure the VPN transport.")
 	}
-	// The XUDP worker discards its caller's context. The TCP health probe learns
-	// this handler's decoded settings pointer before any UDP session is opened.
-	stream.SocketSettings = &internet.SocketConfig{}
 	if p.Kind == "vless_xhttp" {
 		stream.ProtocolName = "splithttp"
 		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{Path: p.Path, Mode: p.Mode})}}
 	}
 	lifetime, cancel := context.WithCancel(e.ctx)
-	t := &xrayTransport{engine: e, ctx: lifetime, cancel: cancel, ping: ping,
+	t := &xrayTransport{engine: e, ctx: lifetime, cancel: cancel, ping: ping, ownerToken: xrayOwnerCounter.Add(1),
 		server: xnet.TCPDestination(xnet.IPAddress(addresses[0].IP), xnet.Port(p.Port))}
+	// Mux workers discard their caller's context. This private protobuf field
+	// carries ownership through the pinned fork's config copies to our dialer;
+	// it is internal metadata, never an OS socket option or a user setting.
+	stream.SocketSettings = &internet.SocketConfig{}
+	stream.SocketSettings.ProtoReflect().SetUnknown(protowire.AppendVarint(protowire.AppendTag(nil, xraySocketOwnerField, protowire.VarintType), t.ownerToken))
+	xraySocketOwners.Store(t.ownerToken, t)
+	tcpConcurrency := int32(-1)
+	if p.Mux {
+		tcpConcurrency = 8
+	}
 	config := &core.Config{
 		App: []*serial.TypedMessage{serial.ToTypedMessage(&dispatcher.Config{}), serial.ToTypedMessage(&proxyman.OutboundConfig{})},
 		Outbound: []*core.OutboundHandlerConfig{{
 			Tag: "vless", SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
 				StreamSettings: stream,
-				// Keep TCP streams separate while carrying UDP, including UDP/443, over XUDP.
-				MultiplexSettings: &proxyman.MultiplexingConfig{Enabled: true, Concurrency: -1, XudpConcurrency: 8, XudpProxyUDP443: "allow"},
+				// TCP mux follows the endpoint setting; UDP, including UDP/443, uses XUDP.
+				MultiplexSettings: &proxyman.MultiplexingConfig{Enabled: true, Concurrency: tcpConcurrency, XudpConcurrency: 8, XudpProxyUDP443: "allow"},
 			}),
 			ProxySettings: serial.ToTypedMessage(&vlessout.Config{Vnext: &protocol.ServerEndpoint{
 				Address: xnet.NewIPOrDomain(t.server.Address), Port: uint32(p.Port),
@@ -108,6 +121,7 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 	t.instance, err = core.NewWithContext(t.ownerContext(lifetime), config)
 	if err != nil {
 		cancel()
+		xraySocketOwners.CompareAndDelete(t.ownerToken, t)
 		return nil, errors.New("Could not configure the VPN transport.")
 	}
 	if err := t.instance.Start(); err != nil {
@@ -182,12 +196,7 @@ func (t *xrayTransport) UDP() (client.HyUDPConn, error) {
 
 func (t *xrayTransport) Close() error {
 	t.cancel()
-	xraySocketOwners.Range(func(settings, owner any) bool {
-		if owner == t {
-			xraySocketOwners.CompareAndDelete(settings, t)
-		}
-		return true
-	})
+	xraySocketOwners.CompareAndDelete(t.ownerToken, t)
 	return t.instance.Close()
 }
 
@@ -214,7 +223,16 @@ func (d *xraySystemDialer) Dial(ctx context.Context, source xnet.Address, dest x
 		if settings == nil {
 			return d.fallback.Dial(ctx, source, dest, nil)
 		}
-		value, ok := xraySocketOwners.Load(settings)
+		metadata := settings.ProtoReflect().GetUnknown()
+		field, kind, n := protowire.ConsumeTag(metadata)
+		if n < 0 || field != xraySocketOwnerField || kind != protowire.VarintType {
+			return nil, errors.New("The VPN socket owner is unavailable.")
+		}
+		token, m := protowire.ConsumeVarint(metadata[n:])
+		if m < 0 || n+m != len(metadata) {
+			return nil, errors.New("The VPN socket owner is unavailable.")
+		}
+		value, ok := xraySocketOwners.Load(token)
 		if !ok {
 			return nil, errors.New("The VPN socket owner is unavailable.")
 		}
@@ -222,13 +240,7 @@ func (d *xraySystemDialer) Dial(ctx context.Context, source xnet.Address, dest x
 		owner = &xrayOwner{transport: t, ctx: t.ctx}
 	}
 	t := owner.transport
-	if settings != nil {
-		xraySocketOwners.Store(settings, t)
-	}
 	if t.ctx.Err() != nil {
-		if settings != nil {
-			xraySocketOwners.CompareAndDelete(settings, t)
-		}
 		return nil, net.ErrClosed
 	}
 	if dest.Network != xnet.Network_TCP || !dest.Address.Family().IsIP() {
