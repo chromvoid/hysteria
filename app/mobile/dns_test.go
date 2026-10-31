@@ -2013,7 +2013,7 @@ func TestTrySwitch(t *testing.T) {
 			t.Fatalf("Existing TCP stream echo = %q, %v", got, err)
 		}
 	}
-	for _, action := range []string{"parallel", "close", "reconnect"} {
+	for _, action := range []string{"parallel", "close", "reconnect", "reconnect-first"} {
 		t.Run(action, func(t *testing.T) {
 			started, release := make(chan struct{}), make(chan struct{})
 			var releaseOnce sync.Once
@@ -2056,6 +2056,49 @@ func TestTrySwitch(t *testing.T) {
 				t.Fatal("Unknown or active endpoint constructed a transport")
 			}
 			pause.Store(true)
+			if action == "reconnect-first" {
+				reconnected := make(chan error, 1)
+				go func() { reconnected <- e.Reconnect() }()
+				select {
+				case <-started:
+				case <-time.After(3 * time.Second):
+					t.Fatal("Reconnect did not reach the data probe")
+				}
+				protected := e.platform.(*transportTestPlatform).protected.Load()
+				result := make(chan bool, 1)
+				go func() { result <- e.TrySwitch(hysteria.ID) }()
+				var completed, switched bool
+				select {
+				case switched = <-result:
+					completed = true
+				case <-time.After(time.Second):
+				}
+				built := e.platform.(*transportTestPlatform).protected.Load() - protected
+				releaseProbe()
+				select {
+				case err := <-reconnected:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("Reconnect did not finish after the probe was released")
+				}
+				if !completed {
+					select {
+					case switched = <-result:
+					case <-time.After(3 * time.Second):
+						t.Fatal("TrySwitch did not finish after Reconnect")
+					}
+				}
+				if !completed || switched || built != 0 {
+					t.Fatalf("TrySwitch during Reconnect: completed = %v, switched = %v, transport sockets = %d; want true, false, 0", completed, switched, built)
+				}
+				if e.ActiveEndpoint() != reality.ID || e.lastGoodID != reality.ID || e.generation.Load() != generation+1 || e.SocksPort() != port || e.HEVConfig() != hev {
+					t.Fatalf("Endpoint after in-flight Reconnect = %q, last good = %q, generation = %d, port = %d", e.ActiveEndpoint(), e.lastGoodID, e.generation.Load(), e.SocksPort())
+				}
+				assertTransportEcho(t, e, false)
+				return
+			}
 			result := make(chan bool, 1)
 			go func() { result <- e.TrySwitch(hysteria.ID) }()
 			select {

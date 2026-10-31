@@ -382,7 +382,7 @@ func (e *Engine) TrySwitch(id string) bool {
 	e.mu.RLock()
 	closed, active, gen := e.closed, e.activeID, e.generation.Load()
 	e.mu.RUnlock()
-	if closed || active == id {
+	if closed || active == "" || active == id {
 		return false
 	}
 	var point endpoint
