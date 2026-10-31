@@ -36,26 +36,28 @@ type fakeName struct {
 }
 
 type dnsResolver struct {
-	engine   *Engine
-	remote   *http.Client
-	direct   *http.Client
-	mu       sync.Mutex
-	byDomain map[string]*fakeName
-	byIP     map[netip.Addr]*fakeName
-	next     uint32
+	engine         *Engine
+	remote         *http.Client
+	direct         *http.Client
+	directFallback *http.Client
+	mu             sync.Mutex
+	byDomain       map[string]*fakeName
+	byIP           map[netip.Addr]*fakeName
+	next           uint32
 }
 
 func newDNSResolver(e *Engine) *dnsResolver {
 	d := &dnsResolver{engine: e, byDomain: make(map[string]*fakeName), byIP: make(map[netip.Addr]*fakeName), next: 1}
-	d.remote = dohClient(e.proxyTCPContext)
-	d.direct = dohClient(e.directTCP)
+	d.remote = dohClient(e.proxyTCPContext, "cloudflare-dns.com")
+	d.direct = dohClient(e.directTCP, "common.dot.dns.yandex.net")
+	d.directFallback = dohClient(e.directTCP, "cloudflare-dns.com")
 	return d
 }
 
-func dohClient(dial func(context.Context, string) (net.Conn, error)) *http.Client {
+func dohClient(dial func(context.Context, string) (net.Conn, error), serverName string) *http.Client {
 	transport := &http.Transport{
 		DialContext:         func(ctx context.Context, _, addr string) (net.Conn, error) { return dial(ctx, addr) },
-		TLSClientConfig:     &tls.Config{ServerName: "cloudflare-dns.com", MinVersion: tls.VersionTLS12},
+		TLSClientConfig:     &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12},
 		TLSHandshakeTimeout: 5 * time.Second,
 		DisableCompression:  true,
 		MaxIdleConns:        2,
@@ -69,6 +71,7 @@ func dohClient(dial func(context.Context, string) (net.Conn, error)) *http.Clien
 func (d *dnsResolver) close() {
 	d.remote.CloseIdleConnections()
 	d.direct.CloseIdleConnections()
+	d.directFallback.CloseIdleConnections()
 }
 
 func normalizedDomain(host string) string { return strings.TrimSuffix(strings.ToLower(host), ".") }
@@ -98,7 +101,7 @@ func (d *dnsResolver) exchange(ctx context.Context, query []byte) ([]byte, error
 		}
 		return response.Pack()
 	}
-	return d.doh(ctx, d.remote, query, request)
+	return d.doh(ctx, d.remote, "https://1.1.1.1/dns-query", query, request)
 }
 
 func parseDNSQuery(query []byte) (*dns.Msg, error) {
@@ -115,8 +118,8 @@ func parseDNSQuery(query []byte) (*dns.Msg, error) {
 	return message, nil
 }
 
-func (d *dnsResolver) doh(ctx context.Context, client *http.Client, query []byte, message *dns.Msg) ([]byte, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://1.1.1.1/dns-query", bytes.NewReader(query))
+func (d *dnsResolver) doh(ctx context.Context, client *http.Client, url string, query []byte, message *dns.Msg) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(query))
 	if err != nil {
 		return nil, errors.New("Could not create the DNS request.")
 	}
@@ -225,21 +228,33 @@ func (d *dnsResolver) resolveDirect(ctx context.Context, host string) ([]net.IPA
 		if err != nil {
 			continue
 		}
-		payload, err := d.doh(ctx, d.direct, query, message)
-		if err != nil {
-			continue
-		}
-		answer := new(dns.Msg)
-		if answer.Unpack(payload) != nil || answer.Rcode != dns.RcodeSuccess {
-			continue
-		}
-		for _, record := range answer.Answer {
-			switch record := record.(type) {
-			case *dns.A:
-				addresses = append(addresses, net.IPAddr{IP: record.A})
-			case *dns.AAAA:
-				addresses = append(addresses, net.IPAddr{IP: record.AAAA})
+		for _, resolver := range []struct {
+			client *http.Client
+			url    string
+		}{
+			{d.direct, "https://77.88.8.8/dns-query"},
+			{d.direct, "https://77.88.8.1/dns-query"},
+			{d.directFallback, "https://1.1.1.1/dns-query"},
+		} {
+			payload, err := d.doh(ctx, resolver.client, resolver.url, query, message)
+			if err != nil {
+				continue
 			}
+			answer := new(dns.Msg)
+			if answer.Unpack(payload) != nil || answer.Rcode == dns.RcodeServerFailure || answer.Rcode == dns.RcodeRefused {
+				continue
+			}
+			if answer.Rcode == dns.RcodeSuccess {
+				for _, record := range answer.Answer {
+					switch record := record.(type) {
+					case *dns.A:
+						addresses = append(addresses, net.IPAddr{IP: record.A})
+					case *dns.AAAA:
+						addresses = append(addresses, net.IPAddr{IP: record.AAAA})
+					}
+				}
+			}
+			break
 		}
 	}
 	if len(addresses) == 0 {

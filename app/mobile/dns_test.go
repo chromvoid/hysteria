@@ -256,6 +256,11 @@ func TestFakeDNSCapacityAndExpiry(t *testing.T) {
 
 func TestDNSForwardingAndResponseValidation(t *testing.T) {
 	d := newTestEngine(t, "ALL").dns
+	d.direct.Transport = dnsRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("Proxied DNS used a direct resolver")
+		return nil, nil
+	})
+	d.directFallback.Transport = d.direct.Transport
 	query := dnsQuery(t, "example.com.", dns.TypeA)
 	question := dnsAnswer(t, query)
 	response := new(dns.Msg)
@@ -303,9 +308,26 @@ func TestDNSForwardingAndResponseValidation(t *testing.T) {
 
 func TestDirectResolutionDoesNotAllocateFakeIPs(t *testing.T) {
 	d := newTestEngine(t, "RUSSIAN_DIRECT").dns
+	for _, tc := range []struct {
+		client     *http.Client
+		serverName string
+	}{{d.direct, "common.dot.dns.yandex.net"}, {d.directFallback, "cloudflare-dns.com"}, {d.remote, "cloudflare-dns.com"}} {
+		config := tc.client.Transport.(*http.Transport).TLSClientConfig
+		if config.ServerName != tc.serverName || config.InsecureSkipVerify {
+			t.Fatalf("Unexpected DoH TLS configuration for %s", tc.serverName)
+		}
+	}
+	d.directFallback.Transport = dnsRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("Cloudflare was contacted after a Yandex answer")
+		return nil, nil
+	})
+	d.remote.Transport = d.directFallback.Transport
 	calls := 0
 	d.direct.Transport = dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		calls++
+		if request.URL.String() != "https://77.88.8.8/dns-query" || request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/dns-message" {
+			t.Fatal("Unexpected direct DoH endpoint, method or content type")
+		}
 		wire, err := io.ReadAll(request.Body)
 		if err != nil {
 			t.Fatal(err)
@@ -345,6 +367,113 @@ func TestDirectResolutionDoesNotAllocateFakeIPs(t *testing.T) {
 	cancel()
 	if _, err := d.resolvePhysical(ctx, "192.0.2.2"); !errors.Is(err, context.Canceled) {
 		t.Fatal("Physical address resolution ignored cancellation")
+	}
+}
+
+func TestDirectDNSFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		results    [3]string
+		wantHosts  []string
+		wantAnswer bool
+	}{
+		{"cloudflare", [3]string{"servfail", "transport", "answer"}, []string{"77.88.8.8", "77.88.8.1", "1.1.1.1"}, true},
+		{"nxdomain", [3]string{"nxdomain"}, []string{"77.88.8.8"}, false},
+		{"empty", [3]string{"empty"}, []string{"77.88.8.8"}, false},
+		{"all-fail", [3]string{"servfail", "transport", "refused"}, []string{"77.88.8.8", "77.88.8.1", "1.1.1.1"}, false},
+		{"refused-and-http", [3]string{"refused", "http", "answer"}, []string{"77.88.8.8", "77.88.8.1", "1.1.1.1"}, true},
+		{"invalid-responses", [3]string{"wrong-id", "wrong-opcode", "wrong-question"}, []string{"77.88.8.8", "77.88.8.1", "1.1.1.1"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newTestEngine(t, "RUSSIAN_DIRECT").dns
+			calls := make(map[uint16][]string)
+			respond := dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				host := request.URL.Host
+				if request.URL.String() != "https://"+host+"/dns-query" || request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/dns-message" {
+					t.Fatal("Unexpected direct DoH endpoint, method or content type")
+				}
+				wire, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				question := dnsAnswer(t, wire)
+				kind := question.Question[0].Qtype
+				calls[kind] = append(calls[kind], host)
+				index := -1
+				for i, endpoint := range []string{"77.88.8.8", "77.88.8.1", "1.1.1.1"} {
+					if host == endpoint {
+						index = i
+					}
+				}
+				if index < 0 {
+					t.Fatalf("Unexpected DNS resolver %s", host)
+				}
+				response := new(dns.Msg)
+				response.SetReply(question)
+				switch tc.results[index] {
+				case "answer":
+					header := dns.RR_Header{Name: "example.ru.", Rrtype: kind, Class: dns.ClassINET, Ttl: 60}
+					if kind == dns.TypeA {
+						response.Answer = []dns.RR{&dns.A{Hdr: header, A: net.ParseIP("192.0.2.2")}}
+					} else {
+						response.Answer = []dns.RR{&dns.AAAA{Hdr: header, AAAA: net.ParseIP("2001:db8::2")}}
+					}
+				case "servfail":
+					response.Rcode = dns.RcodeServerFailure
+				case "refused":
+					response.Rcode = dns.RcodeRefused
+				case "nxdomain":
+					response.Rcode = dns.RcodeNameError
+				case "empty":
+				case "transport":
+					return nil, errors.New("Test DNS transport failure.")
+				case "http":
+					return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(""))}, nil
+				case "wrong-id":
+					response.Id++
+				case "wrong-opcode":
+					response.Opcode = dns.OpcodeStatus
+				case "wrong-question":
+					response.Question[0].Name = "different.example."
+				default:
+					t.Fatalf("Unexpected fallback to %s", host)
+				}
+				answer, err := response.Pack()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(answer))}, nil
+			})
+			d.direct.Transport = dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Host == "1.1.1.1" {
+					t.Fatal("Cloudflare used the Yandex client")
+				}
+				return respond(request)
+			})
+			d.directFallback.Transport = dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Host != "1.1.1.1" {
+					t.Fatal("Yandex used the Cloudflare client")
+				}
+				return respond(request)
+			})
+			d.remote.Transport = dnsRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("Direct DNS used the remote resolver")
+				return nil, nil
+			})
+			addresses, err := d.resolveDirect(context.Background(), "example.ru")
+			if tc.wantAnswer {
+				if err != nil || len(addresses) != 2 || addresses[0].IP.String() != "192.0.2.2" || addresses[1].IP.String() != "2001:db8::2" {
+					t.Fatalf("Direct addresses = %v, error = %v", addresses, err)
+				}
+			} else if err == nil || err.Error() != "DNS resolution failed." || len(addresses) != 0 {
+				t.Fatalf("Failed direct resolution returned %v, %v", addresses, err)
+			}
+			for _, kind := range []uint16{dns.TypeA, dns.TypeAAAA} {
+				if strings.Join(calls[kind], ",") != strings.Join(tc.wantHosts, ",") {
+					t.Fatalf("%s resolver order = %v, want %v", dns.TypeToString[kind], calls[kind], tc.wantHosts)
+				}
+			}
+		})
 	}
 }
 
