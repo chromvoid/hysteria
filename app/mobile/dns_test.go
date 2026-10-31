@@ -4,9 +4,13 @@ package mobile
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +19,8 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,7 +29,22 @@ import (
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/client"
+	hyserver "github.com/apernet/hysteria/core/v2/server"
 	"github.com/miekg/dns"
+	"github.com/xtls/xray-core/app/dispatcher"
+	"github.com/xtls/xray-core/app/proxyman"
+	_ "github.com/xtls/xray-core/app/proxyman/inbound"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	xcore "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/proxy/vless"
+	vlessin "github.com/xtls/xray-core/proxy/vless/inbound"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/reality"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
+	xraw "github.com/xtls/xray-core/transport/internet/tcp"
 )
 
 type dnsRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -1264,5 +1285,856 @@ func TestConcurrentProxyReadAccounting(t *testing.T) {
 	}
 	if e.DownloadMedianBps() == 0 || e.DownloadPeakBps() < 64*1024 {
 		t.Fatal("Parallel active seconds were lost during rollovers")
+	}
+}
+
+// The probe and all proxy destinations stay on loopback, including REALITY's TLS target.
+func localTransportProbe(t *testing.T) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "65536")
+		_, _ = w.Write(bytes.Repeat([]byte("p"), 65536))
+	}))
+	t.Cleanup(server.Close)
+	previous := healthProbeURL
+	healthProbeURL = server.URL + "/__down?bytes=65536"
+	t.Cleanup(func() { healthProbeURL = previous })
+}
+
+type transportTestPlatform struct{ protected atomic.Int64 }
+
+func (p *transportTestPlatform) ProtectSocket(int64) error {
+	p.protected.Add(1)
+	return nil
+}
+
+func transportConfigJSON(t *testing.T, points []endpoint, preferred string) string {
+	t.Helper()
+	wire, err := json.Marshal(mobileConfig{Endpoints: points, PreferredEndpoint: preferred, Routing: "ALL", Rules: &routingRules{ProxySuffix: []string{}, DirectSuffix: []string{}, DirectDomain: []string{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(wire)
+}
+
+func startTransportEngine(t *testing.T, points []endpoint, preferred string) *Engine {
+	t.Helper()
+	e, err := Start(transportConfigJSON(t, points, preferred), &transportTestPlatform{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	return e
+}
+
+func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance) {
+	t.Helper()
+	dest := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	dest.EnableHTTP2 = true
+	dest.TLS = &tls.Config{MinVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.X25519}}
+	dest.StartTLS()
+	t.Cleanup(dest.Close)
+	key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Match Xray's reusable listener and hold the port until its inbound starts.
+	listener, err := internet.ListenSystem(context.Background(), &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	point := endpoint{ID: kind, Kind: kind, Server: "127.0.0.1", Port: port, ServerName: "example.com", UUID: "42d47e34-d5bd-4caf-bc15-947895415293", PublicKey: base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), ShortID: "0123456789abcdef", Fingerprint: "firefox", Flow: flow}
+	protocolName := "tcp"
+	transportSettings := serial.ToTypedMessage(&xraw.Config{})
+	if kind == "vless_xhttp" {
+		point.Path, point.Mode = "/wayveil-test", "auto"
+		protocolName = "splithttp"
+		transportSettings = serial.ToTypedMessage(&splithttp.Config{Path: point.Path, Mode: "auto"})
+	}
+	stream := &internet.StreamConfig{
+		ProtocolName:      protocolName,
+		TransportSettings: []*internet.TransportConfig{{ProtocolName: protocolName, Settings: transportSettings}},
+		SecurityType:      serial.GetMessageType(&reality.Config{}),
+		SecuritySettings: []*serial.TypedMessage{serial.ToTypedMessage(&reality.Config{
+			Dest: dest.Listener.Addr().String(), Type: "tcp", ServerNames: []string{point.ServerName},
+			PrivateKey: key.Bytes(), ShortIds: [][]byte{{1, 35, 69, 103, 137, 171, 205, 239}},
+		})},
+	}
+	instance, err := xcore.New(&xcore.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&dispatcher.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
+			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+		},
+		Inbound: []*xcore.InboundHandlerConfig{{
+			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+				Listen:         xnet.NewIPOrDomain(xnet.LocalHostIP),
+				PortList:       &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(xnet.Port(port))}},
+				StreamSettings: stream,
+			}),
+			ProxySettings: serial.ToTypedMessage(&vlessin.Config{Decryption: "none", Clients: []*protocol.User{{Account: serial.ToTypedMessage(&vless.Account{Id: point.UUID, Flow: flow})}}}),
+		}},
+		Outbound: []*xcore.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{})}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Close() })
+	if err := instance.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return point, instance
+}
+
+func assertTransportEcho(t *testing.T, e *Engine, sharedHTTP2 bool) {
+	t.Helper()
+	platform := e.platform.(*transportTestPlatform)
+	_, xray := e.hy.(*xrayTransport)
+	activeMux := false
+	for _, point := range e.config.Endpoints {
+		if point.ID == e.ActiveEndpoint() {
+			activeMux = point.Mux
+		}
+	}
+	protectedBeforeTCP := platform.protected.Load()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
+	defer cancel()
+	var first net.Conn
+	if xray {
+		first, err = e.proxyTCPContext(ctx, listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer first.Close()
+	}
+	conn, err := e.proxyTCPContext(ctx, listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	payload := bytes.Repeat([]byte("tcp-echo-"), 8192)
+	finished := make(chan error, 1)
+	go func() {
+		echo := func(conn net.Conn) error {
+			if _, err := conn.Write([]byte("h2")); err != nil {
+				return err
+			}
+			var response [2]byte
+			_, err := io.ReadFull(conn, response[:])
+			if err == nil && string(response[:]) != "h2" {
+				err = errors.New("Shared transport echo payload changed")
+			}
+			return err
+		}
+		if first != nil {
+			if err := echo(first); err != nil {
+				finished <- err
+				return
+			}
+			if err := echo(conn); err != nil {
+				finished <- err
+				return
+			}
+			if opened := platform.protected.Load() - protectedBeforeTCP; activeMux && opened > 1 {
+				finished <- fmt.Errorf("Two mux streams opened %d physical sockets; want at most one", opened)
+				return
+			}
+			if opened := platform.protected.Load() - protectedBeforeTCP; !activeMux && !sharedHTTP2 && opened != 2 {
+				finished <- fmt.Errorf("Two non-mux streams opened %d physical sockets; want two", opened)
+				return
+			}
+			// Both streams have transferred data. Closing the first must keep
+			// the shared physical connection alive for the second.
+			_ = first.Close()
+		}
+		if _, err := conn.Write(payload); err != nil {
+			finished <- err
+			return
+		}
+		got := make([]byte, len(payload))
+		_, err := io.ReadFull(conn, got)
+		if err == nil && !bytes.Equal(got, payload) {
+			err = errors.New("TCP echo payload changed")
+		}
+		finished <- err
+	}()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("TCP echo timed out")
+	}
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packet.Close()
+	go func() {
+		var data [2048]byte
+		for {
+			n, address, err := packet.ReadFrom(data[:])
+			if err != nil {
+				return
+			}
+			_, _ = packet.WriteTo(data[:n], address)
+		}
+	}()
+	udp, err := (&routedClient{engine: e}).UDP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	protectedBefore := platform.protected.Load()
+	txBefore, rxBefore := e.TxBytes(), e.RxBytes()
+	message := []byte("xudp-echo")
+	// Loopback is normally a direct route; explicitly exercise the proxy branch.
+	if err := udp.(*routedUDP).sendClassified(message, packet.LocalAddr().String(), packet.LocalAddr().String(), false); err != nil {
+		t.Fatal(err)
+	}
+	gotUDP := make(chan udpResult, 1)
+	go func() {
+		data, address, err := udp.Receive()
+		gotUDP <- udpResult{data: data, addr: address, err: err}
+	}()
+	select {
+	case result := <-gotUDP:
+		if result.err != nil || !bytes.Equal(result.data, message) || result.addr != packet.LocalAddr().String() {
+			t.Fatalf("UDP echo = %q from %q, %v", result.data, result.addr, result.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("UDP echo timed out")
+	}
+	if xray && !sharedHTTP2 && !activeMux && platform.protected.Load() <= protectedBefore {
+		t.Fatal("The XUDP physical socket bypassed platform protection")
+	}
+	if e.TxBytes() <= txBefore || e.RxBytes() <= rxBefore {
+		t.Fatal("UDP traffic bypassed physical socket accounting")
+	}
+}
+
+func TestXrayTransportEcho(t *testing.T) {
+	localTransportProbe(t)
+	for _, tc := range []struct {
+		name, kind, flow string
+		mux              bool
+	}{
+		{"reality", "vless_reality", "", false},
+		{"vision", "vless_reality", "xtls-rprx-vision", false},
+		{"xhttp", "vless_xhttp", "", false},
+		{"reality-mux", "vless_reality", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if raceEnabled && tc.flow == "xtls-rprx-vision" {
+				t.Skip("Upstream Xray Vision uses uintptr pointer arithmetic that fails checkptr under -race (proxy/vless/outbound/outbound.go).")
+			}
+			if raceEnabled && tc.kind == "vless_xhttp" {
+				t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
+			}
+			point, _ := localXrayServer(t, tc.kind, tc.flow)
+			point.Mux = tc.mux
+			platform := &transportTestPlatform{}
+			e, err := Start(transportConfigJSON(t, []endpoint{point}, ""), platform)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.Close() })
+			if e.ActiveEndpoint() != point.ID || platform.protected.Load() == 0 {
+				t.Fatal("The active Xray endpoint must use protected sockets")
+			}
+			if milliseconds, err := e.Ping(); err != nil || milliseconds < 1 {
+				t.Fatalf("Xray Ping = %d ms, %v", milliseconds, err)
+			}
+			assertTransportEcho(t, e, tc.kind == "vless_xhttp")
+			if e.ProxyRxBytes() < 65536 || e.ProxyTxBytes() == 0 || e.RxBytes() == 0 || e.TxBytes() == 0 {
+				t.Fatal("Xray traffic was not counted")
+			}
+		})
+	}
+	t.Run("socket-protection", func(t *testing.T) {
+		listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		point := endpoint{ID: "rejected", Kind: "vless_reality", Server: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, ServerName: "example.com", UUID: "42d47e34-d5bd-4caf-bc15-947895415293", PublicKey: "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM"}
+		platform := &rejectingPlatform{called: make(chan struct{}, 64)}
+		e, err := Start(transportConfigJSON(t, []endpoint{point}, ""), platform)
+		if e != nil {
+			_ = e.Close()
+		}
+		if err == nil || len(platform.called) == 0 {
+			t.Fatal("Socket protection rejection must fail the endpoint")
+		}
+		_ = listener.SetDeadline(time.Now().Add(20 * time.Millisecond))
+		if conn, err := listener.Accept(); err == nil {
+			_ = conn.Close()
+			t.Fatal("Xray connected after socket protection was rejected")
+		} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+			t.Fatal(err)
+		}
+	})
+	t.Run("domain-stream-isolation", func(t *testing.T) {
+		point, _ := localXrayServer(t, "vless_reality", "")
+		e := startTransportEngine(t, []endpoint{point}, "")
+		packet, err := net.ListenPacket("udp", "[::]:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer packet.Close()
+		go func() {
+			var data [2048]byte
+			for {
+				n, address, err := packet.ReadFrom(data[:])
+				if err != nil {
+					return
+				}
+				_, _ = packet.WriteTo(data[:n], address)
+			}
+		}()
+		_, port, _ := net.SplitHostPort(packet.LocalAddr().String())
+		domain, numeric := net.JoinHostPort("localhost", port), net.JoinHostPort("127.0.0.1", port)
+		mapping, err := e.dns.fakeForDomain("localhost")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fake := net.JoinHostPort(mapping.ipv4.String(), port)
+		udp, err := (&routedClient{engine: e}).UDP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer udp.Close()
+		routed := udp.(*routedUDP)
+		exchange := func(destination string) {
+			t.Helper()
+			message := []byte("domain-isolation-echo")
+			var err error
+			if destination == numeric {
+				err = routed.sendClassified(message, destination, destination, false)
+			} else {
+				err = udp.Send(message, destination)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			received := make(chan udpResult, 1)
+			go func() {
+				data, addr, err := udp.Receive()
+				received <- udpResult{data: data, addr: addr, err: err}
+			}()
+			select {
+			case result := <-received:
+				if result.err != nil || !bytes.Equal(result.data, message) {
+					t.Fatalf("UDP session did not preserve echo to %s: %q, %v", destination, result.data, result.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("UDP echo to %s timed out", destination)
+			}
+		}
+		exchange(fake)
+		exchange(numeric)
+		session, err := routed.proxySession()
+		if err != nil {
+			t.Fatal(err)
+		}
+		xudp := session.(*proxyUDP).HyUDPConn.(*xrayUDP)
+		xudp.mu.Lock()
+		ended := xudp.domains[domain]
+		xudp.mu.Unlock()
+		if ended == nil {
+			t.Fatal("Fake-IP UDP did not open a domain stream")
+		}
+		_ = ended.Close()
+		exchange(numeric)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		deadline := time.After(5 * time.Second)
+		for {
+			xudp.mu.Lock()
+			removed := xudp.domains[domain] == nil
+			xudp.mu.Unlock()
+			if removed {
+				break
+			}
+			select {
+			case <-ticker.C:
+			case <-deadline:
+				t.Fatal("The ended domain stream remained cached")
+			}
+		}
+		exchange(fake)
+		xudp.mu.Lock()
+		reopened := xudp.domains[domain]
+		xudp.mu.Unlock()
+		if reopened == nil || reopened == ended {
+			t.Fatal("The domain stream was not reopened")
+		}
+	})
+}
+
+func TestXrayRejectsWrongUUID(t *testing.T) {
+	localTransportProbe(t)
+	point, _ := localXrayServer(t, "vless_reality", "")
+	point.UUID = "e13b0e85-56c9-4f8a-a132-13241725d30e"
+	e, err := Start(transportConfigJSON(t, []endpoint{point}, ""), &transportTestPlatform{})
+	if e != nil {
+		_ = e.Close()
+	}
+	if err == nil {
+		t.Fatal("A server that rejects the UUID must fail the data probe")
+	}
+}
+
+func TestEndpointSelectionAndReconnect(t *testing.T) {
+	localTransportProbe(t)
+	t.Run("unreachable-hysteria", func(t *testing.T) {
+		point, _ := localXrayServer(t, "vless_reality", "")
+		blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blackhole.Close()
+		attempted := make(chan int, 1)
+		go func() {
+			var packet [2048]byte
+			if n, _, err := blackhole.ReadFrom(packet[:]); err == nil {
+				attempted <- n
+			}
+		}()
+		port := blackhole.LocalAddr().(*net.UDPAddr).Port
+		unavailable := endpoint{ID: "hysteria2", Kind: "hysteria2", Server: "127.0.0.1", Port: port, ServerName: "example.com", Password: "ticket"}
+		started := time.Now()
+		e := startTransportEngine(t, []endpoint{unavailable, point}, "")
+		select {
+		case n := <-attempted:
+			if n == 0 {
+				t.Fatal("Hysteria sent an empty initial datagram")
+			}
+		default:
+			t.Fatal("The valid Hysteria endpoint was not attempted before fallback")
+		}
+		if e.ActiveEndpoint() != point.ID || time.Since(started) > 12*time.Second {
+			t.Fatalf("Fallback chose %q after %s", e.ActiveEndpoint(), time.Since(started))
+		}
+	})
+	t.Run("preferred-first", func(t *testing.T) {
+		first, _ := localXrayServer(t, "vless_reality", "")
+		preferred, _ := localXrayServer(t, "vless_reality", "")
+		first.ID, preferred.ID = "first", "preferred"
+		e := startTransportEngine(t, []endpoint{first, preferred}, preferred.ID)
+		if e.ActiveEndpoint() != preferred.ID {
+			t.Fatalf("ActiveEndpoint = %q, want preferred", e.ActiveEndpoint())
+		}
+	})
+	t.Run("reconnect-current-before-restored-first", func(t *testing.T) {
+		first, _ := localXrayServer(t, "vless_reality", "")
+		second, _ := localXrayServer(t, "vless_reality", "")
+		backend := net.JoinHostPort(first.Server, fmt.Sprint(first.Port))
+		relay, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer relay.Close()
+		var available atomic.Bool
+		go func() {
+			for {
+				conn, err := relay.Accept()
+				if err != nil {
+					return
+				}
+				if !available.Load() {
+					_ = conn.Close()
+					continue
+				}
+				go func() {
+					defer conn.Close()
+					upstream, err := net.DialTimeout("tcp", backend, time.Second)
+					if err != nil {
+						return
+					}
+					defer upstream.Close()
+					go func() { _, _ = io.Copy(upstream, conn) }()
+					_, _ = io.Copy(conn, upstream)
+				}()
+			}
+		}()
+		first.ID, first.Port, second.ID = "first", relay.Addr().(*net.TCPAddr).Port, "second"
+		e := startTransportEngine(t, []endpoint{first, second}, first.ID)
+		if e.ActiveEndpoint() != second.ID {
+			t.Fatalf("Initial endpoint = %q, want second", e.ActiveEndpoint())
+		}
+		available.Store(true)
+		ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
+		defer cancel()
+		restored, err := e.newXrayTransport(ctx, first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = probeEndpoint(ctx, restored)
+		_ = restored.Close()
+		if err != nil {
+			t.Fatalf("The first endpoint was not restored: %v", err)
+		}
+		if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != second.ID {
+			t.Fatalf("Reconnect must retain the current endpoint before restored first: %q, %v", e.ActiveEndpoint(), err)
+		}
+	})
+	t.Run("reconnect-next", func(t *testing.T) {
+		first, server := localXrayServer(t, "vless_reality", "")
+		next, _ := localXrayServer(t, "vless_reality", "")
+		first.ID, next.ID = "first", "next"
+		e := startTransportEngine(t, []endpoint{first, next}, "")
+		port, hev := e.SocksPort(), e.HEVConfig()
+		if e.ActiveEndpoint() != first.ID {
+			t.Fatalf("Initial endpoint = %q", e.ActiveEndpoint())
+		}
+		_ = server.Close()
+		if err := e.Reconnect(); err != nil {
+			t.Fatal(err)
+		}
+		if e.ActiveEndpoint() != next.ID || e.SocksPort() != port || e.HEVConfig() != hev {
+			t.Fatalf("Reconnect endpoint = %q, port = %d", e.ActiveEndpoint(), e.SocksPort())
+		}
+		assertTransportEcho(t, e, false)
+	})
+}
+
+func TestEndpointRejectsTruncatedData(t *testing.T) {
+	localTransportProbe(t)
+	point, _ := localXrayServer(t, "vless_reality", "")
+	relay, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	var forwarded atomic.Int64
+	go func() {
+		for {
+			client, err := relay.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer client.Close()
+				upstream, err := net.DialTimeout("tcp", net.JoinHostPort(point.Server, fmt.Sprint(point.Port)), time.Second)
+				if err != nil {
+					return
+				}
+				defer upstream.Close()
+				go func() { _, _ = io.Copy(upstream, client) }()
+				n, _ := io.CopyN(client, upstream, 16*1024)
+				forwarded.Add(n)
+			}()
+		}
+	}()
+	truncated := point
+	truncated.ID, truncated.Port = "truncated", relay.Addr().(*net.TCPAddr).Port
+	e := startTransportEngine(t, []endpoint{truncated, point}, "")
+	if e.ActiveEndpoint() != point.ID || forwarded.Load() < 16*1024 {
+		t.Fatalf("Endpoint = %q, truncated stream forwarded %d bytes", e.ActiveEndpoint(), forwarded.Load())
+	}
+}
+
+type localHysteriaAuth struct{}
+
+func (localHysteriaAuth) Authenticate(_ net.Addr, auth string, _ uint64) (bool, string) {
+	return auth == "legacy-ticket", "local-test"
+}
+
+func TestLegacyHysteriaTransport(t *testing.T) {
+	localTransportProbe(t)
+	certificate := httptest.NewTLSServer(http.NotFoundHandler())
+	defer certificate.Close()
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := hyserver.NewServer(&hyserver.Config{Conn: packet, TLSConfig: hyserver.TLSConfig{Certificates: certificate.TLS.Certificates}, Authenticator: localHysteriaAuth{}, QUICConfig: hyserver.QUICConfig{DisableGSO: true}})
+	if err != nil {
+		_ = packet.Close()
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go func() { _ = server.Serve() }()
+	config := mobileConfig{Profile: profile{Version: 1, Server: "127.0.0.1", Port: packet.LocalAddr().(*net.UDPAddr).Port, ServerName: "example.com", Password: "legacy-ticket", Certificate: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.TLS.Certificates[0].Certificate[0]}))}, Routing: "ALL", Rules: &routingRules{ProxySuffix: []string{}, DirectSuffix: []string{}, DirectDomain: []string{}}}
+	wire, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := Start(string(wire), &transportTestPlatform{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.ActiveEndpoint() != "hysteria2" {
+		t.Fatalf("Legacy profile endpoint = %q", e.ActiveEndpoint())
+	}
+	assertTransportEcho(t, e, false)
+}
+
+func TestEndpointValidation(t *testing.T) {
+	valid := endpoint{ID: "reality", Kind: "vless_reality", Server: "127.0.0.1", Port: 443, ServerName: "example.com", UUID: "42d47e34-d5bd-4caf-bc15-947895415293", PublicKey: "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM", ShortID: "0123456789abcdef"}
+	hysteria := endpoint{ID: "hysteria2", Kind: "hysteria2", Server: "127.0.0.1", Port: 443, ServerName: "example.com", Password: "ticket"}
+	for _, tc := range []struct {
+		name   string
+		change func(*endpoint)
+	}{
+		{"id", func(p *endpoint) { p.ID = "" }},
+		{"server", func(p *endpoint) { p.Server = "bad host" }},
+		{"port", func(p *endpoint) { p.Port = 65536 }},
+		{"uuid", func(p *endpoint) { p.UUID = "private-invalid-uuid" }},
+		{"public-key", func(p *endpoint) { p.PublicKey = "private-invalid-key" }},
+		{"short-id-odd", func(p *endpoint) { p.ShortID = "123" }},
+		{"short-id-long", func(p *endpoint) { p.ShortID = strings.Repeat("a", 18) }},
+		{"short-id-hex", func(p *endpoint) { p.ShortID = "gg" }},
+		{"fingerprint", func(p *endpoint) { p.Fingerprint = "unknown" }},
+		{"vision-mux", func(p *endpoint) { p.Flow, p.Mux = "xtls-rprx-vision", true }},
+		{"flow", func(p *endpoint) { p.Flow = "unsupported" }},
+		{"xhttp-flow", func(p *endpoint) {
+			p.Kind, p.Path, p.Mode, p.Flow = "vless_xhttp", "/xhttp", "auto", "xtls-rprx-vision"
+		}},
+		{"xhttp-mode", func(p *endpoint) { p.Kind, p.Path, p.Mode = "vless_xhttp", "/xhttp", "unsupported" }},
+		{"xhttp-path", func(p *endpoint) { p.Kind, p.Path, p.Mode = "vless_xhttp", "relative-path", "auto" }},
+		{"hysteria-password", func(p *endpoint) { *p = hysteria; p.Password = "" }},
+		{"hysteria-obfs", func(p *endpoint) { *p = hysteria; p.ObfsPassword = "abc" }},
+		{"hysteria-certificate", func(p *endpoint) { *p = hysteria; p.Certificate = "private-invalid-certificate" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			point := valid
+			tc.change(&point)
+			err := Validate(transportConfigJSON(t, []endpoint{point}, ""))
+			if err == nil || strings.Contains(err.Error(), "private-invalid") {
+				t.Fatalf("Endpoint validation = %v", err)
+			}
+			parsed, err := parseConfig(transportConfigJSON(t, []endpoint{point, valid}, "stale-endpoint"))
+			if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].ID != valid.ID {
+				t.Fatalf("Invalid endpoint must be dropped beside a valid endpoint: %+v, %v", parsed.Endpoints, err)
+			}
+		})
+	}
+	t.Run("unknown-kind-beside-valid", func(t *testing.T) {
+		unknown := valid
+		unknown.ID, unknown.Kind = "future", "future-transport"
+		parsed, err := parseConfig(transportConfigJSON(t, []endpoint{unknown, valid}, unknown.ID))
+		if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].ID != valid.ID {
+			t.Fatalf("An unknown endpoint kind must be filtered: %+v, %v", parsed.Endpoints, err)
+		}
+	})
+	t.Run("unknown-field-ignored", func(t *testing.T) {
+		wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality","future_option":{"nested":null}`, 1)
+		if err := Validate(wire); err != nil {
+			t.Fatalf("Unknown endpoint fields must be ignored: %v", err)
+		}
+	})
+	t.Run("backend-catalog", func(t *testing.T) {
+		const wire = `{
+			"endpoints": [
+				{"id": "hysteria2", "kind": "hysteria2", "server": "nl-01.edge.chromvoid.com", "server_port": 443,
+				 "server_name": "nl-01.edge.chromvoid.com", "password": "ticket", "obfs_password": "obfs-secret", "certificate": ""},
+				{"id": "reality", "kind": "vless_reality", "server": "5.253.59.179", "server_port": 443,
+				 "server_name": "nl-01.edge.chromvoid.com", "uuid": "42d47e34-d5bd-4caf-bc15-947895415293",
+				 "public_key": "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM", "short_id": "0123456789abcdef",
+				 "fingerprint": "firefox", "flow": "", "mux": false},
+				{"id": "xhttp", "kind": "vless_xhttp", "server": "5.253.59.179", "server_port": 443,
+				 "server_name": "nl-01.edge.chromvoid.com", "uuid": "42d47e34-d5bd-4caf-bc15-947895415293",
+				 "public_key": "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM", "short_id": "0123456789abcdef",
+				 "fingerprint": "firefox", "flow": "", "mux": false, "path": "/x", "mode": "auto"}
+			],
+			"routing": "ALL", "rules": {}
+		}`
+		for _, tc := range []struct {
+			name string
+			wire string
+			want []string
+		}{
+			{"empty-xhttp-flow", wire, []string{"hysteria2", "vless_reality", "vless_xhttp"}},
+			{"nonempty-xhttp-flow", strings.Replace(wire, `"flow": "", "mux": false, "path"`, `"flow": "xtls-rprx-vision", "mux": false, "path"`, 1), []string{"hysteria2", "vless_reality"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				parsed, err := parseConfig(tc.wire)
+				if err != nil || len(parsed.Endpoints) != len(tc.want) {
+					t.Fatalf("Backend catalog endpoints = %+v, %v", parsed.Endpoints, err)
+				}
+				for i, kind := range tc.want {
+					if parsed.Endpoints[i].Kind != kind || parsed.Endpoints[i].ID != []string{"hysteria2", "reality", "xhttp"}[i] {
+						t.Fatalf("Backend catalog endpoint %d = %+v", i, parsed.Endpoints[i])
+					}
+				}
+			})
+		}
+	})
+	t.Run("unrelated-field-values", func(t *testing.T) {
+		for _, value := range []string{`""`, `false`, `0`, `[]`, `{}`, `null`, `"/x"`, `true`, `1`, `[""]`, `{"value":null}`} {
+			wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality","path":`+value, 1)
+			wantValid := value == `""` || value == `false` || value == `0` || value == `[]` || value == `{}` || value == `null`
+			if err := Validate(wire); (err == nil) != wantValid {
+				t.Fatalf("Unrelated field path=%s: validation = %v, want valid = %t", value, err, wantValid)
+			}
+		}
+		wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality","flow":null`, 1)
+		if err := Validate(wire); err != nil {
+			t.Fatalf("Null flow must be treated as empty: %v", err)
+		}
+	})
+	t.Run("all-invalid", func(t *testing.T) {
+		unknown, invalid := valid, valid
+		unknown.Kind, invalid.Port = "future-transport", 0
+		if err := Validate(transportConfigJSON(t, []endpoint{unknown, invalid}, "")); err == nil {
+			t.Fatal("A nonempty list without a valid endpoint was accepted")
+		}
+	})
+	t.Run("duplicate-id", func(t *testing.T) {
+		duplicate := valid
+		duplicate.Port++
+		parsed, err := parseConfig(transportConfigJSON(t, []endpoint{valid, duplicate}, ""))
+		if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].Port != valid.Port {
+			t.Fatalf("The first valid endpoint ID must be retained: %+v, %v", parsed.Endpoints, err)
+		}
+	})
+	for _, field := range []string{`"mux":"false"`, `"flow":123`} {
+		wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality",`+field, 1)
+		if err := Validate(wire); err == nil {
+			t.Fatalf("Invalid endpoint field accepted: %s", field)
+		}
+		wire = strings.Replace(transportConfigJSON(t, []endpoint{valid, valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality",`+field, 1)
+		parsed, err := parseConfig(wire)
+		if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].ID != valid.ID {
+			t.Fatalf("An invalid field must not discard valid siblings: %+v, %v", parsed.Endpoints, err)
+		}
+	}
+	for _, fingerprint := range []string{"", "chrome", "firefox", "safari", "edge", "ios", "android", "random", "randomized"} {
+		point := valid
+		point.Fingerprint, point.ShortID = fingerprint, ""
+		if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
+			t.Fatalf("Fingerprint %q or empty short ID rejected: %v", fingerprint, err)
+		}
+	}
+	for _, mode := range []string{"auto", "packet-up", "stream-up", "stream-one"} {
+		point := valid
+		point.Kind, point.Path, point.Mode = "vless_xhttp", "/xhttp", mode
+		if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
+			t.Fatalf("XHTTP mode %q rejected: %v", mode, err)
+		}
+	}
+	point := valid
+	point.Mux = true
+	if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
+		t.Fatalf("REALITY without Vision must accept mux: %v", err)
+	}
+	parsed, err := parseConfig(transportConfigJSON(t, []endpoint{valid}, ""))
+	if err != nil || parsed.Endpoints[0].Fingerprint != "firefox" {
+		t.Fatalf("Default fingerprint = %v, %v", parsed.Endpoints, err)
+	}
+}
+
+func TestNoCopyleftDependencies(t *testing.T) {
+	// Reviewed against each module's LICENSE. The ratelimit linking exception
+	// is explicitly accepted. Only runtime dependencies are checked.
+	licenses := map[string]string{
+		"github.com/andybalholm/brotli":         "MIT",
+		"github.com/apernet/hysteria/app/v2":    "MIT",
+		"github.com/apernet/hysteria/core/v2":   "MIT",
+		"github.com/apernet/hysteria/extras/v2": "MIT",
+		"github.com/apernet/quic-go":            "MIT",
+		"github.com/chromvoid/Xray-core":        "MPL-2.0",
+		"github.com/cloudflare/circl":           "BSD-3-Clause",
+		"github.com/gorilla/websocket":          "BSD-2-Clause",
+		"github.com/juju/ratelimit":             "LGPL-3.0 with static-linking exception",
+		"github.com/klauspost/compress":         "BSD-3-Clause",
+		"github.com/klauspost/cpuid/v2":         "MIT",
+		"github.com/miekg/dns":                  "BSD-3-Clause",
+		"github.com/patrickmn/go-cache":         "MIT",
+		"github.com/pires/go-proxyproto":        "Apache-2.0",
+		"github.com/quic-go/qpack":              "MIT",
+		"github.com/refraction-networking/utls": "BSD-3-Clause",
+		"github.com/stretchr/objx":              "MIT",
+		"github.com/stretchr/testify":           "MIT",
+		"github.com/txthinking/runnergroup":     "MIT",
+		"github.com/txthinking/socks5":          "MIT",
+		"github.com/xtls/reality":               "MPL-2.0",
+		"github.com/xtls/xray-core":             "MPL-2.0",
+		"go.yaml.in/yaml/v3":                    "MIT and Apache-2.0",
+		"golang.org/x/crypto":                   "BSD-3-Clause",
+		"golang.org/x/exp":                      "BSD-3-Clause",
+		"golang.org/x/net":                      "BSD-3-Clause",
+		"golang.org/x/sys":                      "BSD-3-Clause",
+		"golang.org/x/text":                     "BSD-3-Clause",
+		"google.golang.org/grpc":                "Apache-2.0",
+		"google.golang.org/protobuf":            "BSD-3-Clause",
+		"lukechampine.com/blake3":               "MIT",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, filepath.Join(runtime.GOROOT(), "bin", "go"), "list", "-mod=readonly", "-deps", "-json=Module", ".")
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("List linked mobile modules: %v: %s", err, &stderr)
+	}
+	type module struct {
+		Path, Version string
+		Replace       *struct{ Path, Version string }
+	}
+	seen := make(map[string]bool)
+	check := func(path string) {
+		t.Helper()
+		for _, prefix := range []string{"github.com/sagernet/", "github.com/metacubex/", "github.com/anytls/"} {
+			if strings.HasPrefix(strings.ToLower(path), prefix) {
+				t.Fatalf("Forbidden linked dependency: %s", path)
+			}
+		}
+		if licenses[path] == "" {
+			t.Fatalf("Linked module requires license review: %s", path)
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for {
+		var p struct{ Module *module }
+		if err := decoder.Decode(&p); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		m := p.Module
+		if m == nil || seen[m.Path] {
+			continue
+		}
+		seen[m.Path] = true
+		check(m.Path)
+		if m.Path == "github.com/xtls/xray-core" && (m.Version != "v1.260327.0" || m.Replace == nil ||
+			m.Replace.Path != "github.com/chromvoid/Xray-core" || m.Replace.Version != "v0.0.0-20261031073143-fa758cf34bed") {
+			t.Fatal("Xray must use the reviewed ChromVoid fork at fa758cf34bedfa9933a64112f9cd1c29ea7a00eb")
+		}
+		if m.Replace != nil {
+			if m.Replace.Version != "" {
+				check(m.Replace.Path)
+			} else if m.Path != "github.com/apernet/hysteria/core/v2" && m.Path != "github.com/apernet/hysteria/extras/v2" {
+				t.Fatalf("Unreviewed local module replacement: %s", m.Path)
+			}
+		}
+	}
+	if !seen["github.com/xtls/xray-core"] {
+		t.Fatal("The dependency check did not include the Xray transport")
 	}
 }

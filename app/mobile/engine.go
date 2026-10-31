@@ -41,9 +41,11 @@ type profile struct {
 }
 
 type mobileConfig struct {
-	Profile profile       `json:"profile"`
-	Routing string        `json:"routing"`
-	Rules   *routingRules `json:"rules"`
+	Profile           profile       `json:"profile"`
+	Endpoints         []endpoint    `json:"endpoints"`
+	PreferredEndpoint string        `json:"preferred_endpoint"`
+	Routing           string        `json:"routing"`
+	Rules             *routingRules `json:"rules"`
 }
 
 func parseConfig(text string) (mobileConfig, error) {
@@ -60,16 +62,24 @@ func parseConfig(text string) (mobileConfig, error) {
 	if err := c.Rules.compile(); err != nil {
 		return c, err
 	}
-	p := &c.Profile
-	if p.Version != 1 || p.Server == "" || strings.ContainsAny(p.Server, "/\\\r\n\t ") || p.Port < 1 || p.Port > 65535 || p.Password == "" ||
-		(c.Routing != "ALL" && c.Routing != "RUSSIAN_DIRECT") || (p.ObfsPassword != "" && len(p.ObfsPassword) < 4) {
+	if c.Routing != "ALL" && c.Routing != "RUSSIAN_DIRECT" {
 		return c, errors.New("Invalid VPN configuration.")
 	}
-	if p.ServerName == "" {
-		p.ServerName = p.Server
+	if len(c.Endpoints) == 0 {
+		p := &c.Profile
+		if p.Version != 1 || p.Server == "" || strings.ContainsAny(p.Server, "/\\\r\n\t ") || p.Port < 1 || p.Port > 65535 || p.Password == "" ||
+			(p.ObfsPassword != "" && len(p.ObfsPassword) < 4) {
+			return c, errors.New("Invalid VPN configuration.")
+		}
+		if p.ServerName == "" {
+			p.ServerName = p.Server
+		}
+		if p.Certificate != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(p.Certificate)) {
+			return c, errors.New("The server certificate is invalid.")
+		}
 	}
-	if p.Certificate != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(p.Certificate)) {
-		return c, errors.New("The server certificate is invalid.")
+	if err := c.validateEndpoints(); err != nil {
+		return c, err
 	}
 	return c, nil
 }
@@ -80,7 +90,13 @@ func Validate(configJSON string) error {
 	return err
 }
 
-// Engine runs the MIT Hysteria2 transport and a loopback SOCKS5 endpoint for HEV.
+type vpnTransport interface {
+	TCPContext(context.Context, string) (net.Conn, error)
+	UDP() (client.HyUDPConn, error)
+	Close() error
+}
+
+// Engine runs the selected VPN transport and a loopback SOCKS5 endpoint for HEV.
 type Engine struct {
 	config   mobileConfig
 	platform Platform
@@ -90,7 +106,8 @@ type Engine struct {
 	dns      *dnsResolver
 
 	mu          sync.RWMutex
-	hy          client.Client
+	hy          vpnTransport
+	activeID    string
 	closed      bool
 	reconnectMu sync.Mutex
 	flowMu      sync.Mutex
@@ -103,7 +120,7 @@ type Engine struct {
 	download    downloadStats
 }
 
-// Start authenticates the Hysteria2 transport and opens a loopback-only endpoint.
+// Start verifies an endpoint's data transfer and opens a loopback-only SOCKS endpoint.
 func Start(configJSON string, platform Platform) (*Engine, error) {
 	c, err := parseConfig(configJSON)
 	if err != nil {
@@ -117,7 +134,7 @@ func Start(configJSON string, platform Platform) (*Engine, error) {
 	e.download.started = time.Now()
 	e.generation.Store(1)
 	e.dns = newDNSResolver(e)
-	if err := e.connect(); err != nil {
+	if err := e.connect(c.PreferredEndpoint); err != nil {
 		_ = e.Close()
 		return nil, errors.New("Could not authenticate the VPN transport. Check the profile and network.")
 	}
@@ -134,13 +151,84 @@ func Start(configJSON string, platform Platform) (*Engine, error) {
 	return e, nil
 }
 
-func (e *Engine) connect() error {
-	p := e.config.Profile
-	ctx, cancel := context.WithTimeout(e.ctx, 8*time.Second)
-	defer cancel()
+// Tests replace the URL with a loopback server to avoid external network access.
+var healthProbeURL = "https://speed.cloudflare.com/__down?bytes=65536"
+
+func (e *Engine) connect(first string) error {
+	endpoints := make([]endpoint, 0, len(e.config.Endpoints))
+	for _, p := range e.config.Endpoints {
+		if p.ID == first {
+			endpoints = append(endpoints, p)
+		}
+	}
+	for _, p := range e.config.Endpoints {
+		if p.ID != first {
+			endpoints = append(endpoints, p)
+		}
+	}
+	for _, p := range endpoints {
+		if err := e.ctx.Err(); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
+		var transport vpnTransport
+		var err error
+		if p.Kind == "hysteria2" {
+			transport, err = e.newHysteriaTransport(ctx, p)
+		} else {
+			transport, err = e.newXrayTransport(ctx, p)
+		}
+		if err == nil {
+			err = probeEndpoint(ctx, transport)
+		}
+		cancel()
+		if err != nil {
+			if transport != nil {
+				_ = transport.Close()
+			}
+			continue
+		}
+		e.mu.Lock()
+		if e.closed || e.ctx.Err() != nil {
+			e.mu.Unlock()
+			_ = transport.Close()
+			return net.ErrClosed
+		}
+		e.hy, e.activeID = transport, p.ID
+		e.mu.Unlock()
+		return nil
+	}
+	return errors.New("No VPN endpoint passed the data transfer check.")
+}
+
+func probeEndpoint(ctx context.Context, transport vpnTransport) error {
+	httpTransport := &http.Transport{DisableKeepAlives: true, DisableCompression: true,
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return transport.TCPContext(ctx, addr)
+		}}
+	defer httpTransport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthProbeURL, nil)
+	if err != nil {
+		return err
+	}
+	response, err := (&http.Client{Transport: httpTransport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}).Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return errors.New("The VPN data transfer check was rejected.")
+	}
+	_, err = io.CopyN(io.Discard, response.Body, 65536)
+	return err
+}
+
+func (e *Engine) newHysteriaTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
 	addresses, err := e.dns.resolvePhysical(ctx, p.Server)
 	if err != nil {
-		return errors.New("Could not resolve the VPN server.")
+		return nil, errors.New("Could not resolve the VPN server.")
 	}
 	ip := addresses[0].IP
 	var roots *x509.CertPool
@@ -151,7 +239,7 @@ func (e *Engine) connect() error {
 	c := &client.Config{
 		ServerAddr: &net.UDPAddr{IP: ip, Port: p.Port}, Auth: p.Password,
 		TLSConfig:   client.TLSConfig{ServerName: p.ServerName, RootCAs: roots},
-		ConnFactory: &packetFactory{engine: e},
+		ConnFactory: &packetFactory{engine: e, obfsPassword: p.ObfsPassword},
 		QUICConfig: client.QUICConfig{
 			InitialStreamReceiveWindow: 256 * 1024, MaxStreamReceiveWindow: 512 * 1024,
 			InitialConnectionReceiveWindow: 1024 * 1024, MaxConnectionReceiveWindow: 2 * 1024 * 1024,
@@ -160,20 +248,25 @@ func (e *Engine) connect() error {
 	}
 	hy, handshake, err := client.NewClientContext(ctx, c)
 	if err != nil {
-		return errors.New("The VPN transport connection failed.")
+		return nil, errors.New("The VPN transport connection failed.")
 	}
 	if !handshake.UDPEnabled {
 		_ = hy.Close()
-		return errors.New("The VPN server does not allow UDP.")
+		return nil, errors.New("The VPN server does not allow UDP.")
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed || e.ctx.Err() != nil {
+	transport, ok := hy.(vpnTransport)
+	if !ok {
 		_ = hy.Close()
-		return net.ErrClosed
+		return nil, errors.New("The VPN transport does not support cancellation.")
 	}
-	e.hy = hy
-	return nil
+	return transport, nil
+}
+
+// ActiveEndpoint returns the selected endpoint ID, or an empty string when disconnected.
+func (e *Engine) ActiveEndpoint() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.activeID
 }
 
 // SocksPort is the loopback TCP port consumed by the native HEV adapter.
@@ -189,7 +282,7 @@ func (e *Engine) HEVConfig() string {
 	return fmt.Sprintf("tunnel:\n  name: wayveil\n  mtu: 1400\n  ipv4: 172.19.0.1\n  ipv6: 'fdfe:dcba:9876::1'\nsocks5:\n  address: 127.0.0.1\n  port: %d\n  udp: udp\nmisc:\n  task-stack-size: 24576\n  tcp-buffer-size: 4096\n  max-session-count: 512\n  connect-timeout: 10000\n  tcp-read-write-timeout: 300000\n  udp-read-write-timeout: 60000\n  log-file: /dev/null\n  log-level: error\n", e.SocksPort())
 }
 
-// Check verifies fresh HTTPS over the Hysteria2 transport, independent of bypass rules.
+// Check verifies fresh HTTPS over the active transport, independent of bypass rules.
 func (e *Engine) Check() error {
 	ctx, cancel := context.WithTimeout(e.ctx, 8*time.Second)
 	defer cancel()
@@ -225,16 +318,16 @@ func (e *Engine) Ping() (int64, error) {
 	if hy == nil {
 		return 0, errors.New("The VPN transport is not connected.")
 	}
-	dialer, ok := hy.(interface {
-		TCPContext(context.Context, string) (net.Conn, error)
-	})
-	if !ok {
-		return 0, errors.New("The VPN transport does not support cancellation.")
-	}
 	ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
 	defer cancel()
+	dial := hy.TCPContext
+	if transport, ok := hy.(interface {
+		PingTCPContext(context.Context, string) (net.Conn, error)
+	}); ok {
+		dial = transport.PingTCPContext
+	}
 	started := time.Now()
-	conn, err := dialer.TCPContext(ctx, "1.1.1.1:443")
+	conn, err := dial(ctx, "1.1.1.1:443")
 	elapsed := time.Since(started)
 	if err != nil {
 		return 0, errors.New("The VPN latency check failed.")
@@ -253,7 +346,9 @@ func (e *Engine) Reconnect() error {
 		return net.ErrClosed
 	}
 	hy := e.hy
+	first := e.activeID
 	e.hy = nil
+	e.activeID = ""
 	e.generation.Add(1)
 	e.mu.Unlock()
 	e.closeFlows()
@@ -261,7 +356,7 @@ func (e *Engine) Reconnect() error {
 		_ = hy.Close()
 	}
 	e.dns.close()
-	if err := e.connect(); err != nil {
+	if err := e.connect(first); err != nil {
 		return errors.New("Could not reconnect the VPN transport.")
 	}
 	return nil
@@ -277,6 +372,7 @@ func (e *Engine) Close() error {
 	e.closed = true
 	hy := e.hy
 	e.hy = nil
+	e.activeID = ""
 	e.cancel()
 	e.generation.Add(1)
 	e.mu.Unlock()
@@ -416,13 +512,7 @@ func (e *Engine) proxyTCPContext(ctx context.Context, addr string) (net.Conn, er
 	if hy == nil {
 		return nil, net.ErrClosed
 	}
-	dialer, ok := hy.(interface {
-		TCPContext(context.Context, string) (net.Conn, error)
-	})
-	if !ok {
-		return nil, errors.New("The VPN transport does not support cancellation.")
-	}
-	conn, err := dialer.TCPContext(ctx, addr)
+	conn, err := hy.TCPContext(ctx, addr)
 	if err != nil {
 		return nil, errors.New("The VPN TCP connection failed.")
 	}
@@ -493,7 +583,10 @@ func (e *Engine) closeFlows() {
 	}
 }
 
-type packetFactory struct{ engine *Engine }
+type packetFactory struct {
+	engine       *Engine
+	obfsPassword string
+}
 
 func (f *packetFactory) New(addr net.Addr) (net.PacketConn, error) {
 	e := f.engine
@@ -512,7 +605,7 @@ func (f *packetFactory) New(addr net.Addr) (net.PacketConn, error) {
 		_ = conn.Close()
 		return nil, net.ErrClosed
 	}
-	if password := e.config.Profile.ObfsPassword; password != "" {
+	if password := f.obfsPassword; password != "" {
 		wrapped, err := obfs.WrapPacketConnSalamander(tracked, []byte(password))
 		if err != nil {
 			_ = tracked.Close()
