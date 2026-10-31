@@ -72,9 +72,37 @@ func (p *endpoint) UnmarshalJSON(wire []byte) error {
 			delete(fields, field)
 			continue
 		}
-		if !allowed || string(valueJSON) == "null" {
+		if allowed {
+			continue
+		}
+		// Backends may serialize zero values for fields of other endpoint kinds.
+		var value any
+		if err := json.Unmarshal(valueJSON, &value); err != nil {
 			return nil
 		}
+		switch value := value.(type) {
+		case string:
+			if value != "" {
+				return nil
+			}
+		case bool:
+			if value {
+				return nil
+			}
+		case float64:
+			if value != 0 {
+				return nil
+			}
+		case []any:
+			if len(value) != 0 {
+				return nil
+			}
+		case map[string]any:
+			if len(value) != 0 {
+				return nil
+			}
+		}
+		delete(fields, field)
 	}
 	// Decode only known keys; unknown values cannot invalidate this endpoint.
 	knownJSON, err := json.Marshal(fields)

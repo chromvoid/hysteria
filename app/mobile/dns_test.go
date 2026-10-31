@@ -1946,6 +1946,56 @@ func TestEndpointValidation(t *testing.T) {
 			t.Fatalf("Unknown endpoint fields must be ignored: %v", err)
 		}
 	})
+	t.Run("backend-catalog", func(t *testing.T) {
+		const wire = `{
+			"endpoints": [
+				{"id": "hysteria2", "kind": "hysteria2", "server": "nl-01.edge.chromvoid.com", "server_port": 443,
+				 "server_name": "nl-01.edge.chromvoid.com", "password": "ticket", "obfs_password": "obfs-secret", "certificate": ""},
+				{"id": "reality", "kind": "vless_reality", "server": "5.253.59.179", "server_port": 443,
+				 "server_name": "nl-01.edge.chromvoid.com", "uuid": "42d47e34-d5bd-4caf-bc15-947895415293",
+				 "public_key": "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM", "short_id": "0123456789abcdef",
+				 "fingerprint": "firefox", "flow": "", "mux": false},
+				{"id": "xhttp", "kind": "vless_xhttp", "server": "5.253.59.179", "server_port": 443,
+				 "server_name": "nl-01.edge.chromvoid.com", "uuid": "42d47e34-d5bd-4caf-bc15-947895415293",
+				 "public_key": "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM", "short_id": "0123456789abcdef",
+				 "fingerprint": "firefox", "flow": "", "mux": false, "path": "/x", "mode": "auto"}
+			],
+			"routing": "ALL", "rules": {}
+		}`
+		for _, tc := range []struct {
+			name string
+			wire string
+			want []string
+		}{
+			{"empty-xhttp-flow", wire, []string{"hysteria2", "vless_reality", "vless_xhttp"}},
+			{"nonempty-xhttp-flow", strings.Replace(wire, `"flow": "", "mux": false, "path"`, `"flow": "xtls-rprx-vision", "mux": false, "path"`, 1), []string{"hysteria2", "vless_reality"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				parsed, err := parseConfig(tc.wire)
+				if err != nil || len(parsed.Endpoints) != len(tc.want) {
+					t.Fatalf("Backend catalog endpoints = %+v, %v", parsed.Endpoints, err)
+				}
+				for i, kind := range tc.want {
+					if parsed.Endpoints[i].Kind != kind || parsed.Endpoints[i].ID != []string{"hysteria2", "reality", "xhttp"}[i] {
+						t.Fatalf("Backend catalog endpoint %d = %+v", i, parsed.Endpoints[i])
+					}
+				}
+			})
+		}
+	})
+	t.Run("unrelated-field-values", func(t *testing.T) {
+		for _, value := range []string{`""`, `false`, `0`, `[]`, `{}`, `null`, `"/x"`, `true`, `1`, `[""]`, `{"value":null}`} {
+			wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality","path":`+value, 1)
+			wantValid := value == `""` || value == `false` || value == `0` || value == `[]` || value == `{}` || value == `null`
+			if err := Validate(wire); (err == nil) != wantValid {
+				t.Fatalf("Unrelated field path=%s: validation = %v, want valid = %t", value, err, wantValid)
+			}
+		}
+		wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality","flow":null`, 1)
+		if err := Validate(wire); err != nil {
+			t.Fatalf("Null flow must be treated as empty: %v", err)
+		}
+	})
 	t.Run("all-invalid", func(t *testing.T) {
 		unknown, invalid := valid, valid
 		unknown.Kind, invalid.Port = "future-transport", 0
@@ -1961,7 +2011,7 @@ func TestEndpointValidation(t *testing.T) {
 			t.Fatalf("The first valid endpoint ID must be retained: %+v, %v", parsed.Endpoints, err)
 		}
 	})
-	for _, field := range []string{`"mux":"false"`, `"flow":null`} {
+	for _, field := range []string{`"mux":"false"`, `"flow":123`} {
 		wire := strings.Replace(transportConfigJSON(t, []endpoint{valid}, ""), `"kind":"vless_reality"`, `"kind":"vless_reality",`+field, 1)
 		if err := Validate(wire); err == nil {
 			t.Fatalf("Invalid endpoint field accepted: %s", field)
