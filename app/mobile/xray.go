@@ -49,6 +49,7 @@ type xrayTransport struct {
 	server     xnet.Destination
 	ping       *internet.MemoryStreamConfig
 	ownerToken uint64
+	untracked  bool
 }
 
 const xraySocketOwnerField protowire.Number = 50000
@@ -93,7 +94,8 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 	}
 	lifetime, cancel := context.WithCancel(e.ctx)
 	t := &xrayTransport{engine: e, ctx: lifetime, cancel: cancel, ping: ping, ownerToken: xrayOwnerCounter.Add(1),
-		server: xnet.TCPDestination(xnet.IPAddress(addresses[0].IP), xnet.Port(p.Port))}
+		untracked: ctx.Value(probeTransportKey{}) != nil,
+		server:    xnet.TCPDestination(xnet.IPAddress(addresses[0].IP), xnet.Port(p.Port))}
 	// Mux workers discard their caller's context. This private protobuf field
 	// carries ownership through the pinned fork's config copies to our dialer;
 	// it is internal metadata, never an OS socket option or a user setting.
@@ -257,9 +259,13 @@ func (d *xraySystemDialer) Dial(ctx context.Context, source xnet.Address, dest x
 	if err != nil {
 		return nil, err
 	}
-	conn, err = t.engine.trackConn(conn, true, t.engine.generation.Load())
-	if err != nil {
-		return nil, err
+	if t.untracked {
+		conn = &trackedConn{Conn: conn, engine: t.engine, count: true}
+	} else {
+		conn, err = t.engine.trackConn(conn, true, t.engine.generation.Load())
+		if err != nil {
+			return nil, err
+		}
 	}
 	// XHTTP and XUDP share raw sockets across logical streams. Closing one
 	// stream must not close a socket still serving other streams.

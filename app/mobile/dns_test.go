@@ -1947,10 +1947,318 @@ func TestEndpointRejectsTruncatedData(t *testing.T) {
 	}
 }
 
-type localHysteriaAuth struct{}
+type localHysteriaAuth struct{ peers chan net.Addr }
 
-func (localHysteriaAuth) Authenticate(_ net.Addr, auth string, _ uint64) (bool, string) {
+func (a localHysteriaAuth) Authenticate(peer net.Addr, auth string, _ uint64) (bool, string) {
+	if auth == "legacy-ticket" {
+		select {
+		case a.peers <- peer:
+		default:
+		}
+	}
 	return auth == "legacy-ticket", "local-test"
+}
+
+func localHysteriaEndpoint(t *testing.T) (endpoint, <-chan net.Addr) {
+	t.Helper()
+	certificate := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(certificate.Close)
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peers := make(chan net.Addr, 1)
+	server, err := hyserver.NewServer(&hyserver.Config{Conn: packet, TLSConfig: hyserver.TLSConfig{Certificates: certificate.TLS.Certificates}, Authenticator: localHysteriaAuth{peers: peers}, QUICConfig: hyserver.QUICConfig{DisableGSO: true}})
+	if err != nil {
+		_ = packet.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	go func() { _ = server.Serve() }()
+	return endpoint{ID: "hysteria2", Kind: "hysteria2", Server: "127.0.0.1", Port: packet.LocalAddr().(*net.UDPAddr).Port, ServerName: "example.com", Password: "legacy-ticket", Certificate: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.TLS.Certificates[0].Certificate[0]}))}, peers
+}
+
+func TestTrySwitch(t *testing.T) {
+	openEcho := func(t *testing.T, e *Engine) net.Conn {
+		t.Helper()
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_, _ = io.Copy(conn, conn)
+		}()
+		conn, err := e.proxyTCP(listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		return conn
+	}
+	exchange := func(t *testing.T, conn net.Conn) {
+		t.Helper()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		message := []byte("surviving-tcp-stream")
+		if _, err := conn.Write(message); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(message))
+		if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, message) {
+			t.Fatalf("Existing TCP stream echo = %q, %v", got, err)
+		}
+	}
+	for _, action := range []string{"parallel", "close", "reconnect", "reconnect-first"} {
+		t.Run(action, func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			releaseProbe := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseProbe()
+			var pause atomic.Bool
+			probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "65536")
+				if pause.Swap(false) {
+					_, _ = w.Write(bytes.Repeat([]byte("p"), 65535))
+					w.(http.Flusher).Flush()
+					close(started)
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return
+					}
+					_, _ = w.Write([]byte("p"))
+					return
+				}
+				_, _ = w.Write(bytes.Repeat([]byte("p"), 65536))
+			}))
+			t.Cleanup(probe.Close)
+			previous := healthProbeURL
+			healthProbeURL = probe.URL
+			t.Cleanup(func() { healthProbeURL = previous })
+			reality, _ := localXrayServer(t, "vless_reality", "")
+			reality.ID = "reality"
+			hysteria, peers := localHysteriaEndpoint(t)
+			e := startTransportEngine(t, []endpoint{hysteria, reality}, reality.ID)
+			port, hev, generation := e.SocksPort(), e.HEVConfig(), e.generation.Load()
+			old := e.hy
+			conn := openEcho(t, e)
+			exchange(t, conn)
+			protected := e.platform.(*transportTestPlatform).protected.Load()
+			if e.TrySwitch("unknown") || e.TrySwitch(reality.ID) {
+				t.Fatal("Unknown and active endpoints must not be probed")
+			}
+			if e.platform.(*transportTestPlatform).protected.Load() != protected {
+				t.Fatal("Unknown or active endpoint constructed a transport")
+			}
+			pause.Store(true)
+			if action == "reconnect-first" {
+				reconnected := make(chan error, 1)
+				go func() { reconnected <- e.Reconnect() }()
+				select {
+				case <-started:
+				case <-time.After(3 * time.Second):
+					t.Fatal("Reconnect did not reach the data probe")
+				}
+				protected := e.platform.(*transportTestPlatform).protected.Load()
+				result := make(chan bool, 1)
+				go func() { result <- e.TrySwitch(hysteria.ID) }()
+				var completed, switched bool
+				select {
+				case switched = <-result:
+					completed = true
+				case <-time.After(time.Second):
+				}
+				built := e.platform.(*transportTestPlatform).protected.Load() - protected
+				releaseProbe()
+				select {
+				case err := <-reconnected:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("Reconnect did not finish after the probe was released")
+				}
+				if !completed {
+					select {
+					case switched = <-result:
+					case <-time.After(3 * time.Second):
+						t.Fatal("TrySwitch did not finish after Reconnect")
+					}
+				}
+				if !completed || switched || built != 0 {
+					t.Fatalf("TrySwitch during Reconnect: completed = %v, switched = %v, transport sockets = %d; want true, false, 0", completed, switched, built)
+				}
+				if e.ActiveEndpoint() != reality.ID || e.lastGoodID != reality.ID || e.generation.Load() != generation+1 || e.SocksPort() != port || e.HEVConfig() != hev {
+					t.Fatalf("Endpoint after in-flight Reconnect = %q, last good = %q, generation = %d, port = %d", e.ActiveEndpoint(), e.lastGoodID, e.generation.Load(), e.SocksPort())
+				}
+				assertTransportEcho(t, e, false)
+				return
+			}
+			result := make(chan bool, 1)
+			go func() { result <- e.TrySwitch(hysteria.ID) }()
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("TrySwitch did not reach the data probe")
+			}
+			peer := <-peers
+			select {
+			case <-result:
+				t.Fatal("TrySwitch completed before receiving all 64 KB")
+			default:
+			}
+			if e.ActiveEndpoint() != reality.ID || e.hy != old || e.generation.Load() != generation {
+				t.Fatal("The in-flight probe changed the active transport")
+			}
+			exchange(t, conn)
+			if action == "parallel" {
+				second := make(chan bool, 1)
+				go func() { second <- e.TrySwitch(hysteria.ID) }()
+				select {
+				case switched := <-second:
+					if switched {
+						t.Fatal("A concurrent TrySwitch must return false")
+					}
+				case <-time.After(time.Second):
+					t.Fatal("A concurrent TrySwitch waited for the active probe")
+				}
+				if built := e.platform.(*transportTestPlatform).protected.Load() - protected; built != 1 {
+					t.Fatalf("Concurrent TrySwitch built %d transport sockets, want one", built)
+				}
+			}
+			if action == "close" || action == "reconnect" {
+				operation := make(chan error, 1)
+				go func() {
+					if action == "close" {
+						operation <- e.Close()
+					} else {
+						operation <- e.Reconnect()
+					}
+				}()
+				select {
+				case err := <-operation:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatalf("%s waited for the TrySwitch probe", action)
+				}
+			}
+			releaseProbe()
+			var switched bool
+			select {
+			case switched = <-result:
+			case <-time.After(3 * time.Second):
+				t.Fatal("TrySwitch did not finish after the probe was released")
+			}
+			wantSwitch := action == "parallel"
+			if switched != wantSwitch {
+				t.Fatalf("TrySwitch = %v, want %v", switched, wantSwitch)
+			}
+			if e.SocksPort() != port || e.HEVConfig() != hev {
+				t.Fatal("TrySwitch changed the SOCKS port or HEV configuration")
+			}
+			if wantSwitch {
+				if e.ActiveEndpoint() != hysteria.ID || e.lastGoodID != hysteria.ID || e.generation.Load() != generation+1 {
+					t.Fatalf("Switched endpoint = %q, last good = %q, generation = %d", e.ActiveEndpoint(), e.lastGoodID, e.generation.Load())
+				}
+				if _, xray := e.hy.(*xrayTransport); xray {
+					t.Fatal("The active transport is still Xray")
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+				if _, err := conn.Read(make([]byte, 1)); err == nil {
+					t.Fatal("The old TCP stream remained open after switching")
+				} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+					t.Fatal("The old TCP stream was not closed after switching")
+				}
+				assertTransportEcho(t, e, false)
+				if !e.TrySwitch(reality.ID) {
+					t.Fatal("TrySwitch could not restore the REALITY endpoint")
+				}
+				if e.ActiveEndpoint() != reality.ID || e.lastGoodID != reality.ID || e.generation.Load() != generation+2 || e.SocksPort() != port || e.HEVConfig() != hev {
+					t.Fatalf("Restored endpoint = %q, last good = %q, generation = %d, port = %d", e.ActiveEndpoint(), e.lastGoodID, e.generation.Load(), e.SocksPort())
+				}
+				xray, ok := e.hy.(*xrayTransport)
+				if !ok {
+					t.Fatal("The restored endpoint is not an Xray transport")
+				}
+				assertTransportEcho(t, e, false)
+				if err := e.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if _, registered := xraySocketOwners.Load(xray.ownerToken); registered || xray.ctx.Err() == nil {
+					t.Fatal("Close retained the promoted Xray transport")
+				}
+			} else {
+				wantID := reality.ID
+				if action == "close" {
+					wantID = ""
+					if e.TrySwitch(hysteria.ID) {
+						t.Fatal("TrySwitch on a closed engine must return false")
+					}
+				}
+				if e.ActiveEndpoint() != wantID || e.lastGoodID != reality.ID || e.generation.Load() != generation+1 {
+					t.Fatalf("After %s: endpoint = %q, last good = %q, generation = %d", action, e.ActiveEndpoint(), e.lastGoodID, e.generation.Load())
+				}
+				packet, err := net.ListenPacket("udp4", peer.String())
+				if err != nil {
+					t.Fatalf("The discarded transport's UDP socket is still open: %v", err)
+				}
+				_ = packet.Close()
+				if action == "reconnect" {
+					assertTransportEcho(t, e, false)
+				}
+			}
+		})
+	}
+	t.Run("unavailable-hysteria", func(t *testing.T) {
+		localTransportProbe(t)
+		reality, _ := localXrayServer(t, "vless_reality", "")
+		reality.ID = "reality"
+		packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := packet.LocalAddr().(*net.UDPAddr).Port
+		_ = packet.Close()
+		hysteria := endpoint{ID: "hysteria2", Kind: "hysteria2", Server: "127.0.0.1", Port: port, ServerName: "example.com", Password: "ticket"}
+		e := startTransportEngine(t, []endpoint{reality, hysteria}, reality.ID)
+		conn := openEcho(t, e)
+		exchange(t, conn)
+		old, generation := e.hy, e.generation.Load()
+		platform := e.platform.(*transportTestPlatform)
+		protected := platform.protected.Load()
+		result := make(chan bool, 1)
+		go func() { result <- e.TrySwitch(hysteria.ID) }()
+		deadline := time.After(3 * time.Second)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for platform.protected.Load() == protected {
+			select {
+			case <-ticker.C:
+			case <-deadline:
+				t.Fatal("TrySwitch did not construct the unavailable transport")
+			}
+		}
+		exchange(t, conn)
+		select {
+		case switched := <-result:
+			if switched {
+				t.Fatal("TrySwitch accepted an unreachable Hysteria endpoint")
+			}
+		case <-time.After(12 * time.Second):
+			t.Fatal("TrySwitch exceeded its ten-second probe timeout")
+		}
+		if e.ActiveEndpoint() != reality.ID || e.lastGoodID != reality.ID || e.hy != old || e.generation.Load() != generation {
+			t.Fatal("The failed probe changed the active transport")
+		}
+		exchange(t, conn)
+	})
 }
 
 func TestLegacyHysteriaTransport(t *testing.T) {

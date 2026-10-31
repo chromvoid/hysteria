@@ -111,6 +111,7 @@ type Engine struct {
 	lastGoodID  string
 	closed      bool
 	reconnectMu sync.Mutex
+	switching   atomic.Bool
 	flowMu      sync.Mutex
 	flows       map[io.Closer]struct{}
 	generation  atomic.Uint64
@@ -177,13 +178,7 @@ func (e *Engine) connect(first string) error {
 			return err
 		}
 		ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
-		var transport vpnTransport
-		var err error
-		if p.Kind == "hysteria2" {
-			transport, err = e.newHysteriaTransport(ctx, p)
-		} else {
-			transport, err = e.newXrayTransport(ctx, p)
-		}
+		transport, err := e.newTransport(ctx, p)
 		if err == nil {
 			err = probeEndpoint(ctx, transport)
 		}
@@ -206,6 +201,16 @@ func (e *Engine) connect(first string) error {
 	}
 	return errors.New("No VPN endpoint passed the data transfer check.")
 }
+
+func (e *Engine) newTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
+	if p.Kind == "hysteria2" {
+		return e.newHysteriaTransport(ctx, p)
+	}
+	return e.newXrayTransport(ctx, p)
+}
+
+// Probe sockets belong to the transport, outside the old generation's flow set.
+type probeTransportKey struct{}
 
 func probeEndpoint(ctx context.Context, transport vpnTransport) error {
 	httpTransport := &http.Transport{DisableKeepAlives: true, DisableCompression: true,
@@ -245,7 +250,7 @@ func (e *Engine) newHysteriaTransport(ctx context.Context, p endpoint) (vpnTrans
 	c := &client.Config{
 		ServerAddr: &net.UDPAddr{IP: ip, Port: p.Port}, Auth: p.Password,
 		TLSConfig:   client.TLSConfig{ServerName: p.ServerName, RootCAs: roots},
-		ConnFactory: &packetFactory{engine: e, obfsPassword: p.ObfsPassword},
+		ConnFactory: &packetFactory{engine: e, obfsPassword: p.ObfsPassword, untracked: ctx.Value(probeTransportKey{}) != nil},
 		QUICConfig: client.QUICConfig{
 			InitialStreamReceiveWindow: 256 * 1024, MaxStreamReceiveWindow: 512 * 1024,
 			InitialConnectionReceiveWindow: 1024 * 1024, MaxConnectionReceiveWindow: 2 * 1024 * 1024,
@@ -366,6 +371,69 @@ func (e *Engine) Reconnect() error {
 		return errors.New("Could not reconnect the VPN transport.")
 	}
 	return nil
+}
+
+// TrySwitch probes an endpoint without interrupting traffic, then replaces the transport.
+func (e *Engine) TrySwitch(id string) bool {
+	if !e.switching.CompareAndSwap(false, true) {
+		return false
+	}
+	defer e.switching.Store(false)
+	e.mu.RLock()
+	closed, active, gen := e.closed, e.activeID, e.generation.Load()
+	e.mu.RUnlock()
+	if closed || active == "" || active == id {
+		return false
+	}
+	var point endpoint
+	for _, p := range e.config.Endpoints {
+		if p.ID == id {
+			point = p
+			break
+		}
+	}
+	if point.ID == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
+	transport, err := e.newTransport(context.WithValue(ctx, probeTransportKey{}, true), point)
+	if err == nil {
+		err = probeEndpoint(ctx, transport)
+	}
+	cancel()
+	if err != nil {
+		if transport != nil {
+			_ = transport.Close()
+		}
+		return false
+	}
+	e.reconnectMu.Lock()
+	defer e.reconnectMu.Unlock()
+	e.mu.Lock()
+	if e.closed || e.generation.Load() != gen {
+		e.mu.Unlock()
+		_ = transport.Close()
+		return false
+	}
+	old := e.hy
+	// Snapshot before publishing the new generation so new flows survive the swap.
+	e.flowMu.Lock()
+	flows := make([]io.Closer, 0, len(e.flows))
+	for flow := range e.flows {
+		flows = append(flows, flow)
+	}
+	e.generation.Add(1)
+	e.hy, e.activeID, e.lastGoodID = transport, id, id
+	e.flowMu.Unlock()
+	e.mu.Unlock()
+	for _, flow := range flows {
+		_ = flow.Close()
+	}
+	if old != nil {
+		_ = old.Close()
+	}
+	e.dns.close()
+	return true
 }
 
 // Close stops listeners, accepted flows, DNS requests and the encrypted transport.
@@ -592,6 +660,7 @@ func (e *Engine) closeFlows() {
 type packetFactory struct {
 	engine       *Engine
 	obfsPassword string
+	untracked    bool
 }
 
 func (f *packetFactory) New(addr net.Addr) (net.PacketConn, error) {
@@ -607,7 +676,7 @@ func (f *packetFactory) New(addr net.Addr) (net.PacketConn, error) {
 		return nil, errors.New("Could not open the VPN transport socket.")
 	}
 	tracked := &trackedPacket{PacketConn: conn, engine: e}
-	if !e.addFlow(tracked, gen) {
+	if !f.untracked && !e.addFlow(tracked, gen) {
 		_ = conn.Close()
 		return nil, net.ErrClosed
 	}
