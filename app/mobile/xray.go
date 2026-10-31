@@ -331,6 +331,10 @@ func (u *xrayUDP) Send(data []byte, address string) error {
 	// needs a fixed XUDP stream so resolution stays at the proxy server.
 	conn := u.domains[address]
 	if conn == nil {
+		if len(u.domains) >= 32 {
+			u.mu.Unlock()
+			return errors.New("Too many proxied UDP destinations.")
+		}
 		conn, err = core.Dial(u.transport.ownerContext(u.ctx), u.transport.instance, xnet.UDPDestination(xnet.DomainAddress(host), xnet.Port(port)))
 		if err != nil {
 			u.mu.Unlock()
@@ -340,11 +344,18 @@ func (u *xrayUDP) Send(data []byte, address string) error {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
+			defer func() {
+				u.mu.Lock()
+				if u.domains[address] == conn {
+					delete(u.domains, address)
+				}
+				u.mu.Unlock()
+				_ = conn.Close()
+			}()
 			buffer := make([]byte, 65535)
 			for {
 				n, err := conn.Read(buffer)
 				if err != nil {
-					u.deliver(udpResult{err: err})
 					return
 				}
 				u.deliver(udpResult{data: append([]byte(nil), buffer[:n]...), addr: net.JoinHostPort(host, strconv.Itoa(port))})
