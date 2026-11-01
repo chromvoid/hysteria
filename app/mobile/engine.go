@@ -21,6 +21,7 @@ import (
 
 	"github.com/apernet/hysteria/app/v2/internal/socks5"
 	"github.com/apernet/hysteria/core/v2/client"
+	coreErrs "github.com/apernet/hysteria/core/v2/errors"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 )
 
@@ -124,6 +125,7 @@ type Engine struct {
 
 // Start verifies an endpoint's data transfer and opens a loopback-only SOCKS endpoint.
 func Start(configJSON string, platform Platform) (*Engine, error) {
+	lastStartReport.Store("[]")
 	c, err := parseConfig(configJSON)
 	if err != nil {
 		return nil, err
@@ -138,7 +140,10 @@ func Start(configJSON string, platform Platform) (*Engine, error) {
 	e.dns = newDNSResolver(e)
 	if err := e.connect(c.PreferredEndpoint); err != nil {
 		_ = e.Close()
-		return nil, errors.New("Could not authenticate the VPN transport. Check the profile and network.")
+		if errors.Is(err, errEndpointAuth) {
+			return nil, errEndpointAuth
+		}
+		return nil, errEndpointCheck
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -156,7 +161,64 @@ func Start(configJSON string, platform Platform) (*Engine, error) {
 // Tests replace the URL with a loopback server to avoid external network access.
 var healthProbeURL = "https://speed.cloudflare.com/__down?bytes=65536"
 
+var endpointTimeout = 10 * time.Second
+var connectTimeout = 30 * time.Second
+var wallNow = func() time.Time { return time.Now().Round(0) }
+
+var errEndpointAuth = errors.New("Could not authenticate the VPN transport. Check the profile and network.")
+var errEndpointCheck = errors.New("No VPN endpoint passed the data transfer check.")
+
+type endpointAttempt struct {
+	ID    string `json:"id"`
+	Kind  string `json:"kind"`
+	Stage string `json:"stage"`
+	MS    int64  `json:"ms"`
+}
+
+var lastStartReport atomic.Value // JSON string, shared across engines.
+
+// LastStartReport returns endpoint IDs, kinds, stages and wall-clock durations
+// from the latest Start or Reconnect attempt, without connection details.
+func LastStartReport() string {
+	if report := lastStartReport.Load(); report != nil {
+		return report.(string)
+	}
+	return "[]"
+}
+
+type endpointStageError struct {
+	stage string
+	err   error
+}
+
+func (e endpointStageError) Error() string {
+	if e.stage == "resolve" {
+		return "Could not resolve the VPN server."
+	}
+	return "The VPN transport connection failed."
+}
+
+func (e endpointStageError) Unwrap() error { return e.err }
+
+type connectDeadlineKey struct{}
+
+// Go's monotonic timers may pause during device sleep. Check wall time at
+// stage boundaries as well, before starting any more network work.
+func connectContextError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Value(connectDeadlineKey{}).(time.Time); ok && !wallNow().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 func (e *Engine) connect(first string) error {
+	deadline := wallNow().Add(connectTimeout)
+	ctx, cancel := context.WithTimeout(e.ctx, connectTimeout)
+	defer cancel()
+	ctx = context.WithValue(ctx, connectDeadlineKey{}, deadline)
 	endpoints := make([]endpoint, 0, len(e.config.Endpoints))
 	for _, p := range e.config.Endpoints {
 		if p.ID == first {
@@ -173,20 +235,55 @@ func (e *Engine) connect(first string) error {
 			endpoints = append(endpoints, p)
 		}
 	}
-	for _, p := range endpoints {
-		if err := e.ctx.Err(); err != nil {
+	report := make([]endpointAttempt, 0, len(endpoints))
+	defer func() {
+		encoded, _ := json.Marshal(report)
+		lastStartReport.Store(string(encoded))
+	}()
+	allAuth := true
+	for i, p := range endpoints {
+		if err := connectContextError(ctx); err != nil {
+			for _, remaining := range endpoints[i:] {
+				report = append(report, endpointAttempt{ID: remaining.ID, Kind: remaining.Kind, Stage: "deadline"})
+			}
+			if i > 0 && allAuth {
+				return errEndpointAuth
+			}
 			return err
 		}
-		ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
-		transport, err := e.newTransport(ctx, p)
-		if err == nil {
-			err = probeEndpoint(ctx, transport)
-		}
-		cancel()
+		started := wallNow()
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, min(endpointTimeout, deadline.Sub(started)))
+		stage := "handshake"
+		transport, err := e.newTransport(attemptCtx, p)
 		if err != nil {
-			if transport != nil {
-				_ = transport.Close()
+			var stageErr endpointStageError
+			var authErr coreErrs.AuthError
+			if errors.As(err, &stageErr) {
+				stage = stageErr.stage
 			}
+			if errors.As(err, &authErr) {
+				stage = "auth"
+			}
+		} else {
+			err = connectContextError(attemptCtx)
+		}
+		if err == nil {
+			stage = "probe"
+			err = probeEndpoint(attemptCtx, transport)
+			if err == nil {
+				err = connectContextError(attemptCtx)
+			}
+		}
+		attemptCancel()
+		if err == nil {
+			stage = "ok"
+		}
+		if err != nil && transport != nil {
+			_ = transport.Close()
+		}
+		report = append(report, endpointAttempt{ID: p.ID, Kind: p.Kind, Stage: stage, MS: max(0, wallNow().Sub(started).Milliseconds())})
+		allAuth = allAuth && stage == "auth"
+		if err != nil {
 			continue
 		}
 		e.mu.Lock()
@@ -199,7 +296,10 @@ func (e *Engine) connect(first string) error {
 		e.mu.Unlock()
 		return nil
 	}
-	return errors.New("No VPN endpoint passed the data transfer check.")
+	if len(report) > 0 && allAuth {
+		return errEndpointAuth
+	}
+	return errEndpointCheck
 }
 
 func (e *Engine) newTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
@@ -239,7 +339,10 @@ func probeEndpoint(ctx context.Context, transport vpnTransport) error {
 func (e *Engine) newHysteriaTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
 	addresses, err := e.dns.resolvePhysical(ctx, p.Server)
 	if err != nil {
-		return nil, errors.New("Could not resolve the VPN server.")
+		return nil, endpointStageError{stage: "resolve", err: err}
+	}
+	if err := connectContextError(ctx); err != nil {
+		return nil, endpointStageError{stage: "resolve", err: err}
 	}
 	ip := addresses[0].IP
 	var roots *x509.CertPool
@@ -259,7 +362,11 @@ func (e *Engine) newHysteriaTransport(ctx context.Context, p endpoint) (vpnTrans
 	}
 	hy, handshake, err := client.NewClientContext(ctx, c)
 	if err != nil {
-		return nil, errors.New("The VPN transport connection failed.")
+		return nil, endpointStageError{stage: "handshake", err: err}
+	}
+	if err := connectContextError(ctx); err != nil {
+		_ = hy.Close()
+		return nil, endpointStageError{stage: "handshake", err: err}
 	}
 	if !handshake.UDPEnabled {
 		_ = hy.Close()
@@ -351,6 +458,7 @@ func (e *Engine) Ping() (int64, error) {
 func (e *Engine) Reconnect() error {
 	e.reconnectMu.Lock()
 	defer e.reconnectMu.Unlock()
+	lastStartReport.Store("[]")
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
