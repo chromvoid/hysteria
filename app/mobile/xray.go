@@ -62,7 +62,10 @@ var xraySocketOwners sync.Map // uint64 -> *xrayTransport
 func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
 	addresses, err := e.dns.resolvePhysical(ctx, p.Server)
 	if err != nil {
-		return nil, errors.New("Could not resolve the VPN server.")
+		return nil, endpointStageError{stage: "resolve", err: err}
+	}
+	if err := connectContextError(ctx); err != nil {
+		return nil, endpointStageError{stage: "resolve", err: err}
 	}
 	xrayDialerOnce.Do(func() {
 		xrayDialerError = internet.RegisterDialerController(xraySocketController)
@@ -93,6 +96,8 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{Path: p.Path, Mode: p.Mode})}}
 	}
 	lifetime, cancel := context.WithCancel(e.ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
 	t := &xrayTransport{engine: e, ctx: lifetime, cancel: cancel, ping: ping, ownerToken: xrayOwnerCounter.Add(1),
 		untracked: ctx.Value(probeTransportKey{}) != nil,
 		server:    xnet.TCPDestination(xnet.IPAddress(addresses[0].IP), xnet.Port(p.Port))}
@@ -129,6 +134,30 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 	if err := t.instance.Start(); err != nil {
 		_ = t.Close()
 		return nil, errors.New("Could not start the VPN transport.")
+	}
+	if err := connectContextError(ctx); err != nil {
+		_ = t.Close()
+		return nil, err
+	}
+	// Construction starts no network handshake. Verify REALITY here so a
+	// failed entry handshake is distinct from the subsequent data probe.
+	handshakeCtx, finish := context.WithCancel(ctx)
+	conn, err := t.PingTCPContext(handshakeCtx, "")
+	if err == nil {
+		_ = conn.Close()
+	}
+	finish()
+	if err != nil {
+		_ = t.Close()
+		return nil, errors.New("The VPN transport connection failed.")
+	}
+	if err := connectContextError(ctx); err != nil {
+		_ = t.Close()
+		return nil, err
+	}
+	if !stop() {
+		_ = t.Close()
+		return nil, ctx.Err()
 	}
 	return t, nil
 }

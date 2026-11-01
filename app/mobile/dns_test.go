@@ -1726,6 +1726,38 @@ func TestXrayRejectsWrongUUID(t *testing.T) {
 
 func TestEndpointSelectionAndReconnect(t *testing.T) {
 	localTransportProbe(t)
+	previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
+	endpointTimeout, connectTimeout = time.Second, 3*time.Second
+	t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
+	assertReport := func(t *testing.T, points []endpoint, stages []string) []endpointAttempt {
+		t.Helper()
+		report := LastStartReport()
+		var attempts []endpointAttempt
+		decoder := json.NewDecoder(strings.NewReader(report))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&attempts); err != nil {
+			t.Fatalf("Invalid start report %q: %v", report, err)
+		}
+		if len(attempts) != len(points) {
+			t.Fatalf("Start report = %s, want %d endpoints", report, len(points))
+		}
+		var fields []map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(report), &fields); err != nil {
+			t.Fatal(err)
+		}
+		for i, point := range points {
+			attempt := attempts[i]
+			if attempt.ID != point.ID || attempt.Kind != point.Kind || attempt.Stage != stages[i] || attempt.MS < 0 || len(fields[i]) != 4 {
+				t.Fatalf("Unexpected endpoint report: %s", report)
+			}
+			for _, secret := range []string{point.Password, point.UUID, point.Server, point.ServerName} {
+				if secret != "" && strings.Contains(report, secret) {
+					t.Fatalf("Start report exposed a credential or server address: %s", report)
+				}
+			}
+		}
+		return attempts
+	}
 	t.Run("unreachable-hysteria", func(t *testing.T) {
 		point, _ := localXrayServer(t, "vless_reality", "")
 		blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -1752,9 +1784,177 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		default:
 			t.Fatal("The valid Hysteria endpoint was not attempted before fallback")
 		}
-		if e.ActiveEndpoint() != point.ID || time.Since(started) > 12*time.Second {
+		if e.ActiveEndpoint() != point.ID || time.Since(started) > endpointTimeout+2*time.Second {
 			t.Fatalf("Fallback chose %q after %s", e.ActiveEndpoint(), time.Since(started))
 		}
+		assertReport(t, []endpoint{unavailable, point}, []string{"handshake", "ok"})
+	})
+	t.Run("silent-reality-before-xhttp", func(t *testing.T) {
+		if raceEnabled {
+			t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
+		}
+		reality, _ := localXrayServer(t, "vless_reality", "")
+		xhttp, _ := localXrayServer(t, "vless_xhttp", "")
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		closed := make(chan struct{}, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_, _ = io.Copy(io.Discard, conn)
+			closed <- struct{}{}
+		}()
+		reality.Port = listener.Addr().(*net.TCPAddr).Port
+		started := time.Now()
+		e := startTransportEngine(t, []endpoint{reality, xhttp}, "")
+		if e.ActiveEndpoint() != xhttp.ID || time.Since(started) > endpointTimeout+2*time.Second {
+			t.Fatalf("Silent REALITY fallback chose %q after %s", e.ActiveEndpoint(), time.Since(started))
+		}
+		assertReport(t, []endpoint{reality, xhttp}, []string{"handshake", "ok"})
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("Canceled REALITY handshake left its TCP socket open")
+		}
+	})
+	t.Run("all-silent", func(t *testing.T) {
+		previous := connectTimeout
+		connectTimeout = 1500 * time.Millisecond
+		defer func() { connectTimeout = previous }()
+		blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blackhole.Close()
+		go func() {
+			var packet [2048]byte
+			for {
+				if _, _, err := blackhole.ReadFrom(packet[:]); err != nil {
+					return
+				}
+			}
+		}()
+		points := make([]endpoint, 4)
+		for i := range points {
+			points[i] = endpoint{ID: fmt.Sprintf("silent-%d", i), Kind: "hysteria2", Server: "127.0.0.1", Port: blackhole.LocalAddr().(*net.UDPAddr).Port, ServerName: "example.com", Password: "silent-ticket"}
+		}
+		started := time.Now()
+		e, err := Start(transportConfigJSON(t, points, ""), &transportTestPlatform{})
+		if e != nil {
+			_ = e.Close()
+		}
+		if err == nil || err.Error() != "No VPN endpoint passed the data transfer check." || time.Since(started) > connectTimeout+2*time.Second {
+			t.Fatalf("All-silent Start = %v after %s", err, time.Since(started))
+		}
+		attempts := assertReport(t, points, []string{"handshake", "handshake", "deadline", "deadline"})
+		for _, attempt := range attempts {
+			if attempt.MS > (endpointTimeout+time.Second).Milliseconds() || (attempt.Stage == "deadline" && attempt.MS != 0) {
+				t.Fatalf("Endpoint exceeded its attempt limit: %+v", attempt)
+			}
+		}
+	})
+	t.Run("authentication-denied", func(t *testing.T) {
+		point, _ := localHysteriaEndpoint(t)
+		point.Password = "rejected-ticket"
+		e, err := Start(transportConfigJSON(t, []endpoint{point}, ""), &transportTestPlatform{})
+		if e != nil {
+			_ = e.Close()
+		}
+		if err == nil || err.Error() != "Could not authenticate the VPN transport. Check the profile and network." {
+			t.Fatalf("Authentication-denied Start = %v", err)
+		}
+		assertReport(t, []endpoint{point}, []string{"auth"})
+	})
+	t.Run("wall-clock-sleep", func(t *testing.T) {
+		first, _ := localHysteriaEndpoint(t)
+		next, _ := localXrayServer(t, "vless_reality", "")
+		var sleep atomic.Int64
+		previousClock, previousProbe := wallNow, healthProbeURL
+		wallNow = func() time.Time { return time.Now().Round(0).Add(time.Duration(sleep.Load())) }
+		t.Cleanup(func() { wallNow, healthProbeURL = previousClock, previousProbe })
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sleep.Store(int64(time.Minute))
+			w.Header().Set("Content-Length", "65536")
+			_, _ = w.Write([]byte("p"))
+		}))
+		defer server.Close()
+		healthProbeURL = server.URL
+		started := time.Now()
+		e, err := Start(transportConfigJSON(t, []endpoint{first, next}, ""), &transportTestPlatform{})
+		if e != nil {
+			_ = e.Close()
+		}
+		if err == nil || err.Error() != "No VPN endpoint passed the data transfer check." || time.Since(started) > time.Second {
+			t.Fatalf("Wall-clock deadline Start = %v after %s", err, time.Since(started))
+		}
+		attempts := assertReport(t, []endpoint{first, next}, []string{"probe", "deadline"})
+		if attempts[0].MS < time.Minute.Milliseconds() || attempts[1].MS != 0 {
+			t.Fatalf("Wall-clock sleep was lost from the report: %+v", attempts)
+		}
+	})
+	t.Run("probe-read-cancellation", func(t *testing.T) {
+		point, _ := localHysteriaEndpoint(t)
+		canceled := make(chan struct{}, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "65536")
+			_, _ = w.Write(bytes.Repeat([]byte("p"), 32768))
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			canceled <- struct{}{}
+		}))
+		defer server.Close()
+		previous := healthProbeURL
+		healthProbeURL = server.URL
+		defer func() { healthProbeURL = previous }()
+		started := time.Now()
+		e, err := Start(transportConfigJSON(t, []endpoint{point}, ""), &transportTestPlatform{})
+		if e != nil {
+			_ = e.Close()
+		}
+		if err == nil || err.Error() != "No VPN endpoint passed the data transfer check." || time.Since(started) > endpointTimeout+time.Second {
+			t.Fatalf("Stalled probe Start = %v after %s", err, time.Since(started))
+		}
+		assertReport(t, []endpoint{point}, []string{"probe"})
+		select {
+		case <-canceled:
+		case <-time.After(time.Second):
+			t.Fatal("Canceled data probe left its HTTP stream open")
+		}
+	})
+	t.Run("resolve-cancellation", func(t *testing.T) {
+		var requests atomic.Int64
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			requests.Add(1)
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+		e := newTestEngine(t, "ALL")
+		platform := &transportTestPlatform{}
+		e.platform = platform
+		point := endpoint{ID: "unresolved", Kind: "hysteria2", Server: "vpn.example.test", Port: 443, ServerName: "example.com", Password: "dns-ticket"}
+		e.config.Endpoints = []endpoint{point}
+		transport := e.dns.direct.Transport.(*http.Transport)
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return e.directTCP(ctx, server.Listener.Addr().String())
+		}
+		transport.TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+		transport.TLSClientConfig.ServerName = server.Listener.Addr().(*net.TCPAddr).IP.String()
+		e.dns.directFallback = e.dns.direct
+		started := time.Now()
+		if err := e.connect(""); err == nil || time.Since(started) > endpointTimeout+time.Second {
+			t.Fatalf("Stalled physical DNS = %v after %s", err, time.Since(started))
+		}
+		if requests.Load() != 1 || platform.protected.Load() != 1 {
+			t.Fatalf("Physical DNS requests = %d, protected sockets = %d; want 1 each", requests.Load(), platform.protected.Load())
+		}
+		assertReport(t, []endpoint{point}, []string{"resolve"})
 	})
 	t.Run("preferred-first", func(t *testing.T) {
 		first, _ := localXrayServer(t, "vless_reality", "")
@@ -1900,6 +2100,7 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		if e.ActiveEndpoint() != first.ID {
 			t.Fatalf("Initial endpoint = %q", e.ActiveEndpoint())
 		}
+		assertReport(t, []endpoint{first}, []string{"ok"})
 		_ = server.Close()
 		if err := e.Reconnect(); err != nil {
 			t.Fatal(err)
@@ -1907,6 +2108,7 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		if e.ActiveEndpoint() != next.ID || e.SocksPort() != port || e.HEVConfig() != hev {
 			t.Fatalf("Reconnect endpoint = %q, port = %d", e.ActiveEndpoint(), e.SocksPort())
 		}
+		assertReport(t, []endpoint{first, next}, []string{"handshake", "ok"})
 		assertTransportEcho(t, e, false)
 	})
 }
