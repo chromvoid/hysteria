@@ -141,12 +141,35 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 	}
 	// Construction starts no network handshake. Verify REALITY here so a
 	// failed entry handshake is distinct from the subsequent data probe.
-	handshakeCtx, finish := context.WithCancel(ctx)
-	conn, err := t.PingTCPContext(handshakeCtx, "")
-	if err == nil {
-		_ = conn.Close()
+	// Match VLESS outbound's five attempts and 0/200/400/600 ms retry delays,
+	// while allowing the attempt deadline to interrupt the backoff as well.
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			delay := time.NewTimer(time.Duration(attempt-1) * 200 * time.Millisecond)
+			select {
+			case <-delay.C:
+			case <-ctx.Done():
+			}
+			delay.Stop()
+		}
+		if err = connectContextError(ctx); err != nil {
+			break
+		}
+		handshakeCtx, finish := context.WithCancel(ctx)
+		var conn net.Conn
+		conn, err = t.PingTCPContext(handshakeCtx, "")
+		if err == nil {
+			_ = conn.Close()
+		}
+		finish()
+		if err == nil {
+			break
+		}
+		if deadlineErr := connectContextError(ctx); deadlineErr != nil {
+			err = deadlineErr
+			break
+		}
 	}
-	finish()
 	if err != nil {
 		_ = t.Close()
 		return nil, errors.New("The VPN transport connection failed.")

@@ -1786,6 +1786,50 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		}
 		assertReport(t, []endpoint{unavailable, point}, []string{"handshake", "ok"})
 	})
+	t.Run("reality-retries-initial-reset", func(t *testing.T) {
+		point, _ := localXrayServer(t, "vless_reality", "")
+		backend := net.JoinHostPort(point.Server, fmt.Sprint(point.Port))
+		relay, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer relay.Close()
+		var accepted atomic.Int64
+		reset := make(chan error, 1)
+		go func() {
+			for {
+				conn, err := relay.AcceptTCP()
+				if err != nil {
+					return
+				}
+				if accepted.Add(1) == 1 {
+					err := conn.SetLinger(0)
+					_ = conn.Close()
+					reset <- err
+					continue
+				}
+				go func() {
+					defer conn.Close()
+					upstream, err := net.DialTimeout("tcp", backend, time.Second)
+					if err != nil {
+						return
+					}
+					defer upstream.Close()
+					go func() { _, _ = io.Copy(upstream, conn) }()
+					_, _ = io.Copy(conn, upstream)
+				}()
+			}
+		}()
+		point.Port = relay.Addr().(*net.TCPAddr).Port
+		e := startTransportEngine(t, []endpoint{point}, "")
+		if err := <-reset; err != nil {
+			t.Fatalf("Could not reset the initial REALITY connection: %v", err)
+		}
+		if e.ActiveEndpoint() != point.ID || accepted.Load() < 2 {
+			t.Fatalf("REALITY endpoint = %q after %d connections; want success after retry", e.ActiveEndpoint(), accepted.Load())
+		}
+		assertReport(t, []endpoint{point}, []string{"ok"})
+	})
 	t.Run("silent-reality-before-xhttp", func(t *testing.T) {
 		if raceEnabled {
 			t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
