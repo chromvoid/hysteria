@@ -1726,9 +1726,6 @@ func TestXrayRejectsWrongUUID(t *testing.T) {
 
 func TestEndpointSelectionAndReconnect(t *testing.T) {
 	localTransportProbe(t)
-	previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
-	endpointTimeout, connectTimeout = time.Second, 3*time.Second
-	t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
 	assertReport := func(t *testing.T, points []endpoint, stages []string) []endpointAttempt {
 		t.Helper()
 		report := LastStartReport()
@@ -1793,6 +1790,9 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		if raceEnabled {
 			t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
 		}
+		previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
+		endpointTimeout, connectTimeout = 5*time.Second, 15*time.Second
+		t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
 		reality, _ := localXrayServer(t, "vless_reality", "")
 		xhttp, _ := localXrayServer(t, "vless_xhttp", "")
 		listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -1824,9 +1824,9 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		}
 	})
 	t.Run("all-silent", func(t *testing.T) {
-		previous := connectTimeout
-		connectTimeout = 1500 * time.Millisecond
-		defer func() { connectTimeout = previous }()
+		previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
+		endpointTimeout, connectTimeout = time.Second, 1500*time.Millisecond
+		t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
 		blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -1899,6 +1899,9 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		}
 	})
 	t.Run("probe-read-cancellation", func(t *testing.T) {
+		previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
+		endpointTimeout, connectTimeout = time.Second, 3*time.Second
+		t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
 		point, _ := localHysteriaEndpoint(t)
 		canceled := make(chan struct{}, 1)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1928,6 +1931,9 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		}
 	})
 	t.Run("resolve-cancellation", func(t *testing.T) {
+		previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
+		endpointTimeout, connectTimeout = time.Second, 3*time.Second
+		t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
 		var requests atomic.Int64
 		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, r.Body)
