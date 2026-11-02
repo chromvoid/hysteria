@@ -13,26 +13,36 @@ import (
 )
 
 type endpoint struct {
-	ID           string `json:"id"`
-	Kind         string `json:"kind"`
-	Server       string `json:"server"`
-	Port         int    `json:"server_port"`
-	ServerName   string `json:"server_name,omitempty"`
-	Password     string `json:"password,omitempty"`
-	ObfsPassword string `json:"obfs_password,omitempty"`
-	Certificate  string `json:"certificate,omitempty"`
-	UUID         string `json:"uuid,omitempty"`
-	PublicKey    string `json:"public_key,omitempty"`
-	ShortID      string `json:"short_id,omitempty"`
-	Fingerprint  string `json:"fingerprint,omitempty"`
-	Flow         string `json:"flow,omitempty"`
-	Mux          bool   `json:"mux,omitempty"`
-	Path         string `json:"path,omitempty"`
-	Mode         string `json:"mode,omitempty"`
-	invalid      bool
+	ID            string `json:"id"`
+	Kind          string `json:"kind"`
+	Server        string `json:"server"`
+	Port          int    `json:"server_port"`
+	ServerName    string `json:"server_name,omitempty"`
+	Password      string `json:"password,omitempty"`
+	ObfsPassword  string `json:"obfs_password,omitempty"`
+	Certificate   string `json:"certificate,omitempty"`
+	UUID          string `json:"uuid,omitempty"`
+	PublicKey     string `json:"public_key,omitempty"`
+	ShortID       string `json:"short_id,omitempty"`
+	Fingerprint   string `json:"fingerprint,omitempty"`
+	Flow          string `json:"flow,omitempty"`
+	Mux           bool   `json:"mux,omitempty"`
+	Path          string `json:"path,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	UplinkMethod  string `json:"uplink_method,omitempty"`
+	DataPlacement string `json:"data_placement,omitempty"`
+	MaxPostBytes  int    `json:"max_post_bytes,omitempty"`
+	Encryption    string `json:"encryption,omitempty"`
+	invalid       bool
 }
 
 var errInvalidEndpoint = errors.New("Invalid VPN endpoint configuration")
+
+// Xray's minimum cookie chunk is 2048 encoded bytes: 24433 payload bytes become
+// 32578 base64 bytes in at most 16 x_data_N cookies. Names and '=' take 150 bytes,
+// '; ' separators take 30, and "Cookie: " plus CRLF take 10: exactly 32768 bytes.
+// One more payload byte would require a 32769-byte line.
+const maximumCDNCookiePostBytes = 24433
 
 func endpointFieldError(field, reason string) error {
 	return fmt.Errorf("%w: %s %s.", errInvalidEndpoint, field, reason)
@@ -62,12 +72,30 @@ func (p *endpoint) UnmarshalJSON(wire []byte) error {
 			allowed = true
 		case "password", "obfs_password", "certificate":
 			allowed = kind == "hysteria2"
-		case "uuid", "public_key", "short_id", "fingerprint", "mux":
+		case "uuid", "fingerprint":
+			allowed = kind == "vless_reality" || kind == "vless_xhttp" || kind == "vless_xhttp_cdn"
+		case "public_key", "short_id", "mux":
+			if kind == "vless_xhttp_cdn" {
+				return nil
+			}
 			allowed = kind == "vless_reality" || kind == "vless_xhttp"
 		case "flow":
+			if kind == "vless_xhttp_cdn" {
+				return nil
+			}
 			allowed = kind == "vless_reality"
 		case "path", "mode":
-			allowed = kind == "vless_xhttp"
+			allowed = kind == "vless_xhttp" || kind == "vless_xhttp_cdn"
+		case "uplink_method", "data_placement", "encryption":
+			allowed = kind == "vless_xhttp_cdn"
+		case "max_post_bytes":
+			allowed = kind == "vless_xhttp_cdn"
+			if allowed {
+				var size int
+				if json.Unmarshal(valueJSON, &size) != nil || size < 1024 || size > 1048576 {
+					return nil
+				}
+			}
 		default:
 			delete(fields, field)
 			continue
@@ -171,16 +199,16 @@ func (p *endpoint) validate() error {
 		if p.Certificate != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(p.Certificate)) {
 			return endpointFieldError("certificate", "must contain a PEM certificate")
 		}
-	case "vless_reality", "vless_xhttp":
+	case "vless_reality", "vless_xhttp", "vless_xhttp_cdn":
 		return p.validateVLESS()
 	default:
-		return endpointFieldError("kind", "must be hysteria2, vless_reality or vless_xhttp")
+		return endpointFieldError("kind", "must be hysteria2, vless_reality, vless_xhttp or vless_xhttp_cdn")
 	}
 	return nil
 }
 
 func (p *endpoint) validateVLESS() error {
-	if p.ServerName == "" {
+	if p.ServerName == "" && p.Kind != "vless_xhttp_cdn" {
 		return endpointFieldError("server_name", "is required for REALITY")
 	}
 	if len(p.UUID) != 36 || p.UUID[8] != '-' || p.UUID[13] != '-' || p.UUID[18] != '-' || p.UUID[23] != '-' {
@@ -189,12 +217,14 @@ func (p *endpoint) validateVLESS() error {
 	if value, err := hex.DecodeString(strings.ReplaceAll(p.UUID, "-", "")); err != nil || len(value) != 16 {
 		return endpointFieldError("uuid", "must be a UUID")
 	}
-	publicKey, err := base64.RawURLEncoding.Strict().DecodeString(p.PublicKey)
-	if err != nil || len(p.PublicKey) != 43 || len(publicKey) != 32 {
-		return endpointFieldError("public_key", "must be a 32-byte base64url X25519 key")
-	}
-	if _, err := hex.DecodeString(p.ShortID); err != nil || len(p.ShortID) > 16 {
-		return endpointFieldError("short_id", "must contain 0 to 16 hexadecimal characters with even length")
+	if p.Kind != "vless_xhttp_cdn" {
+		publicKey, err := base64.RawURLEncoding.Strict().DecodeString(p.PublicKey)
+		if err != nil || len(p.PublicKey) != 43 || len(publicKey) != 32 {
+			return endpointFieldError("public_key", "must be a 32-byte base64url X25519 key")
+		}
+		if _, err := hex.DecodeString(p.ShortID); err != nil || len(p.ShortID) > 16 {
+			return endpointFieldError("short_id", "must contain 0 to 16 hexadecimal characters with even length")
+		}
 	}
 	if p.Fingerprint == "" {
 		p.Fingerprint = "firefox"
@@ -203,6 +233,70 @@ func (p *endpoint) validateVLESS() error {
 	case "chrome", "firefox", "safari", "edge", "ios", "android", "random", "randomized":
 	default:
 		return endpointFieldError("fingerprint", "is not supported")
+	}
+	if p.Kind == "vless_xhttp_cdn" {
+		for field, host := range map[string]string{"server": p.Server, "server_name": p.ServerName} {
+			name := strings.TrimSuffix(host, ".")
+			if name == "" || len(name) > 253 || net.ParseIP(name) != nil {
+				return endpointFieldError(field, "must be a hostname, not an IP address")
+			}
+			for _, label := range strings.Split(name, ".") {
+				if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+					return endpointFieldError(field, "must be a hostname")
+				}
+				for _, char := range label {
+					if char != '-' && (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+						return endpointFieldError(field, "must be a hostname")
+					}
+				}
+			}
+		}
+		if p.Path == "" || !strings.HasPrefix(p.Path, "/") || len(p.Path) > 128 || strings.ContainsAny(p.Path, "\r\n\t ?#") {
+			return endpointFieldError("path", "must be an absolute HTTP path of at most 128 bytes")
+		}
+		if p.Mode != "packet-up" {
+			return endpointFieldError("mode", "must be packet-up")
+		}
+		if p.UplinkMethod == "" {
+			p.UplinkMethod = "GET"
+		}
+		switch p.UplinkMethod {
+		case "GET", "POST", "PUT":
+		default:
+			return endpointFieldError("uplink_method", "must be GET, POST or PUT")
+		}
+		if p.DataPlacement == "" {
+			p.DataPlacement = "header"
+		}
+		switch p.DataPlacement {
+		case "header", "cookie":
+		case "body":
+			if p.UplinkMethod == "GET" {
+				return endpointFieldError("data_placement", "cannot be body with GET")
+			}
+		default:
+			return endpointFieldError("data_placement", "must be header, cookie or body")
+		}
+		if p.MaxPostBytes == 0 {
+			p.MaxPostBytes = 8192
+		}
+		if p.MaxPostBytes < 1024 || p.MaxPostBytes > 1048576 {
+			return endpointFieldError("max_post_bytes", "must be between 1024 and 1048576")
+		}
+		// Leave room for base64 expansion, padding and metadata within 64 KiB of headers.
+		if p.DataPlacement == "header" && p.MaxPostBytes > 32768 {
+			return endpointFieldError("max_post_bytes", "must not exceed 32768 with header placement")
+		}
+		if p.DataPlacement == "cookie" && p.MaxPostBytes > maximumCDNCookiePostBytes {
+			return endpointFieldError("max_post_bytes", fmt.Sprintf("must not exceed %d with cookie placement", maximumCDNCookiePostBytes))
+		}
+		if p.Encryption == "" {
+			p.Encryption = "none"
+		}
+		if len(p.Encryption) > 2048 || (p.Encryption != "none" && !strings.HasPrefix(p.Encryption, "mlkem768x25519plus.")) {
+			return endpointFieldError("encryption", "must be none or mlkem768x25519plus, at most 2048 bytes")
+		}
+		return nil
 	}
 	if p.Kind == "vless_reality" {
 		if p.Flow != "" && p.Flow != "xtls-rprx-vision" {

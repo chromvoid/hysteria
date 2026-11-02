@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -30,6 +31,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/tcp"
+	xtls "github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -59,8 +61,15 @@ var xrayDialerError error
 var xrayOwnerCounter atomic.Uint64
 var xraySocketOwners sync.Map // uint64 -> *xrayTransport
 
+// Tests may add a local trust root without changing the catalog configuration.
+var xrayTLSRootCertificates []*xtls.Certificate
+
 func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
-	addresses, err := e.dns.resolvePhysical(ctx, p.Server)
+	resolveCtx := ctx
+	if p.Kind == "vless_xhttp_cdn" {
+		resolveCtx = context.WithValue(ctx, cdnResolveKey{}, true)
+	}
+	addresses, err := e.dns.resolvePhysical(resolveCtx, p.Server)
 	if err != nil {
 		return nil, endpointStageError{stage: "resolve", err: err}
 	}
@@ -87,9 +96,36 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 		ProtocolName: "tcp", SecurityType: security.Type, SecuritySettings: []*serial.TypedMessage{security},
 		TransportSettings: []*internet.TransportConfig{{ProtocolName: "tcp", Settings: serial.ToTypedMessage(&tcp.Config{})}},
 	}
-	ping, err := internet.ToMemoryStreamConfig(stream)
-	if err != nil {
-		return nil, errors.New("Could not configure the VPN transport.")
+	var ping *internet.MemoryStreamConfig
+	account := &vless.Account{Id: p.UUID, Flow: p.Flow, Encryption: "none"}
+	if p.Kind == "vless_xhttp_cdn" {
+		security = serial.ToTypedMessage(&xtls.Config{
+			ServerName: p.ServerName, Fingerprint: p.Fingerprint, NextProtocol: []string{"h2", "http/1.1"},
+			Certificate: xrayTLSRootCertificates,
+		})
+		stream.SecurityType, stream.SecuritySettings = security.Type, []*serial.TypedMessage{security}
+		stream.ProtocolName = "splithttp"
+		var dataKey string
+		switch p.DataPlacement {
+		case "header":
+			dataKey = "X-Data"
+		case "cookie":
+			dataKey = "x_data"
+		}
+		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{
+			Host: p.ServerName, Path: p.Path, Mode: "packet-up", UplinkHTTPMethod: p.UplinkMethod, UplinkDataPlacement: p.DataPlacement,
+			UplinkDataKey:      dataKey,
+			ScMaxEachPostBytes: &splithttp.RangeConfig{From: int32(p.MaxPostBytes), To: int32(p.MaxPostBytes)},
+		})}}
+		account, err = cdnVLESSAccount(p)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		ping, err = internet.ToMemoryStreamConfig(stream)
+		if err != nil {
+			return nil, errors.New("Could not configure the VPN transport.")
+		}
 	}
 	if p.Kind == "vless_xhttp" {
 		stream.ProtocolName = "splithttp"
@@ -121,7 +157,7 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 			}),
 			ProxySettings: serial.ToTypedMessage(&vlessout.Config{Vnext: &protocol.ServerEndpoint{
 				Address: xnet.NewIPOrDomain(t.server.Address), Port: uint32(p.Port),
-				User: &protocol.User{Account: serial.ToTypedMessage(&vless.Account{Id: p.UUID, Flow: p.Flow, Encryption: "none"})},
+				User: &protocol.User{Account: serial.ToTypedMessage(account)},
 			}}),
 		}},
 	}
@@ -139,35 +175,37 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 		_ = t.Close()
 		return nil, err
 	}
-	// Construction starts no network handshake. Verify REALITY here so a
-	// failed entry handshake is distinct from the subsequent data probe.
-	// Match VLESS outbound's five attempts and 0/200/400/600 ms retry delays,
-	// while allowing the attempt deadline to interrupt the backoff as well.
-	for attempt := 0; attempt < 5; attempt++ {
-		if attempt > 0 {
-			delay := time.NewTimer(time.Duration(attempt-1) * 200 * time.Millisecond)
-			select {
-			case <-delay.C:
-			case <-ctx.Done():
+	if ping != nil {
+		// Construction starts no network handshake. Verify REALITY here so a
+		// failed entry handshake is distinct from the subsequent data probe.
+		// Match VLESS outbound's five attempts and 0/200/400/600 ms retry delays,
+		// while allowing the attempt deadline to interrupt the backoff as well.
+		for attempt := 0; attempt < 5; attempt++ {
+			if attempt > 0 {
+				delay := time.NewTimer(time.Duration(attempt-1) * 200 * time.Millisecond)
+				select {
+				case <-delay.C:
+				case <-ctx.Done():
+				}
+				delay.Stop()
 			}
-			delay.Stop()
-		}
-		if err = connectContextError(ctx); err != nil {
-			break
-		}
-		handshakeCtx, finish := context.WithCancel(ctx)
-		var conn net.Conn
-		conn, err = t.PingTCPContext(handshakeCtx, "")
-		if err == nil {
-			_ = conn.Close()
-		}
-		finish()
-		if err == nil {
-			break
-		}
-		if deadlineErr := connectContextError(ctx); deadlineErr != nil {
-			err = deadlineErr
-			break
+			if err = connectContextError(ctx); err != nil {
+				break
+			}
+			handshakeCtx, finish := context.WithCancel(ctx)
+			var conn net.Conn
+			conn, err = t.PingTCPContext(handshakeCtx, "")
+			if err == nil {
+				_ = conn.Close()
+			}
+			finish()
+			if err == nil {
+				break
+			}
+			if deadlineErr := connectContextError(ctx); deadlineErr != nil {
+				err = deadlineErr
+				break
+			}
 		}
 	}
 	if err != nil {
@@ -183,6 +221,53 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 		return nil, ctx.Err()
 	}
 	return t, nil
+}
+
+// The protobuf account expects parsed encryption fields, unlike the catalog's
+// VLESS Encryption string normally processed by Xray's JSON config builder.
+func cdnVLESSAccount(p endpoint) (*vless.Account, error) {
+	a := &vless.Account{Id: p.UUID, Encryption: p.Encryption}
+	if p.Encryption == "none" {
+		return a, nil
+	}
+	invalid := errors.New("Could not configure VLESS encryption.")
+	parts := strings.Split(p.Encryption, ".")
+	if len(parts) < 4 || parts[0] != "mlkem768x25519plus" {
+		return nil, invalid
+	}
+	switch parts[1] {
+	case "native":
+	case "xorpub":
+		a.XorMode = 1
+	case "random":
+		a.XorMode = 2
+	default:
+		return nil, invalid
+	}
+	switch parts[2] {
+	case "1rtt":
+	case "0rtt":
+		a.Seconds = 1
+	default:
+		return nil, invalid
+	}
+	keys := parts[3:]
+	padding := 0
+	for _, part := range keys {
+		if len(part) < 20 {
+			padding++
+			continue
+		}
+		key, err := base64.RawURLEncoding.DecodeString(part)
+		if err != nil || (len(key) != 32 && len(key) != 1184) {
+			return nil, invalid
+		}
+	}
+	if padding == len(keys) {
+		return nil, invalid
+	}
+	a.Padding, a.Encryption = strings.Join(keys[:padding], "."), strings.Join(keys[padding:], ".")
+	return a, nil
 }
 
 func (t *xrayTransport) ownerContext(ctx context.Context) context.Context {
@@ -216,6 +301,9 @@ func (t *xrayTransport) TCPContext(ctx context.Context, address string) (net.Con
 // PingTCPContext measures the protected REALITY handshake to the entry server.
 // It avoids core.Dial's asynchronous pipe and sends no destination payload.
 func (t *xrayTransport) PingTCPContext(ctx context.Context, _ string) (net.Conn, error) {
+	if t.ping == nil {
+		return nil, errors.New("The VPN transport requires a data transfer latency check.")
+	}
 	ctx = context.WithValue(ctx, xrayOwnerKey{}, &xrayOwner{transport: t, ctx: ctx, ping: true})
 	conn, err := internet.Dial(ctx, t.server, t.ping)
 	if err != nil {
