@@ -61,8 +61,15 @@ var xrayDialerError error
 var xrayOwnerCounter atomic.Uint64
 var xraySocketOwners sync.Map // uint64 -> *xrayTransport
 
+// Tests may add a local trust root without changing the catalog configuration.
+var xrayTLSRootCertificates []*xtls.Certificate
+
 func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport, error) {
-	addresses, err := e.dns.resolvePhysical(ctx, p.Server)
+	resolveCtx := ctx
+	if p.Kind == "vless_xhttp_cdn" {
+		resolveCtx = context.WithValue(ctx, cdnResolveKey{}, true)
+	}
+	addresses, err := e.dns.resolvePhysical(resolveCtx, p.Server)
 	if err != nil {
 		return nil, endpointStageError{stage: "resolve", err: err}
 	}
@@ -94,11 +101,20 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 	if p.Kind == "vless_xhttp_cdn" {
 		security = serial.ToTypedMessage(&xtls.Config{
 			ServerName: p.ServerName, Fingerprint: p.Fingerprint, NextProtocol: []string{"h2", "http/1.1"},
+			Certificate: xrayTLSRootCertificates,
 		})
 		stream.SecurityType, stream.SecuritySettings = security.Type, []*serial.TypedMessage{security}
 		stream.ProtocolName = "splithttp"
+		var dataKey string
+		switch p.DataPlacement {
+		case "header":
+			dataKey = "X-Data"
+		case "cookie":
+			dataKey = "x_data"
+		}
 		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{
 			Host: p.ServerName, Path: p.Path, Mode: "packet-up", UplinkHTTPMethod: p.UplinkMethod, UplinkDataPlacement: p.DataPlacement,
+			UplinkDataKey:      dataKey,
 			ScMaxEachPostBytes: &splithttp.RangeConfig{From: int32(p.MaxPostBytes), To: int32(p.MaxPostBytes)},
 		})}}
 		account, err = cdnVLESSAccount(p)

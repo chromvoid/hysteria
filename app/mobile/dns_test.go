@@ -5,7 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
-	"crypto/ed25519"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/tls"
@@ -31,7 +32,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	_ "unsafe"
 
 	"github.com/apernet/hysteria/core/v2/client"
 	hyserver "github.com/apernet/hysteria/core/v2/server"
@@ -395,6 +395,12 @@ func TestDirectResolutionDoesNotAllocateFakeIPs(t *testing.T) {
 	if _, err := d.resolvePhysical(ctx, "192.0.2.2"); !errors.Is(err, context.Canceled) {
 		t.Fatal("Physical address resolution ignored cancellation")
 	}
+	platform := &transportTestPlatform{}
+	d.engine.platform = platform
+	addresses, err = d.resolvePhysical(context.Background(), "example.ru")
+	if err != nil || len(addresses) != 2 || platform.dnsCalls.Load() != 0 {
+		t.Fatalf("Successful physical DoH = %v, %v; platform DNS calls = %d", addresses, err, platform.dnsCalls.Load())
+	}
 }
 
 func TestDirectDNSFallback(t *testing.T) {
@@ -499,6 +505,75 @@ func TestDirectDNSFallback(t *testing.T) {
 				if strings.Join(calls[kind], ",") != strings.Join(tc.wantHosts, ",") {
 					t.Fatalf("%s resolver order = %v, want %v", dns.TypeToString[kind], calls[kind], tc.wantHosts)
 				}
+			}
+		})
+	}
+	for _, network := range []string{"udp", "tcp"} {
+		t.Run("physical-"+network, func(t *testing.T) {
+			packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer packet.Close()
+			listener, err := net.Listen("tcp4", packet.LocalAddr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			previousPort := physicalDNSPort
+			physicalDNSPort = fmt.Sprint(packet.LocalAddr().(*net.UDPAddr).Port)
+			defer func() { physicalDNSPort = previousPort }()
+			var udpCalls, tcpCalls atomic.Int64
+			handler := dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+				response := new(dns.Msg)
+				response.SetReply(request)
+				if w.RemoteAddr().Network() == "udp" {
+					udpCalls.Add(1)
+					response.Truncated = network == "tcp"
+				} else {
+					tcpCalls.Add(1)
+				}
+				question := request.Question[0]
+				if question.Name != "abc.cdn.example.ru." {
+					t.Errorf("Unexpected physical DNS name: %s", question.Name)
+				}
+				if !response.Truncated {
+					header := dns.RR_Header{Name: question.Name, Rrtype: question.Qtype, Class: dns.ClassINET}
+					if question.Qtype == dns.TypeA {
+						response.Answer = []dns.RR{&dns.A{Hdr: header, A: net.IPv4(192, 0, 2, 7)}}
+					} else {
+						response.Answer = []dns.RR{&dns.AAAA{Hdr: header, AAAA: net.ParseIP("2001:db8::7")}}
+					}
+				}
+				_ = w.WriteMsg(response)
+			})
+			udpServer := &dns.Server{PacketConn: packet, Handler: handler}
+			tcpServer := &dns.Server{Listener: listener, Handler: handler}
+			go func() { _ = udpServer.ActivateAndServe() }()
+			go func() { _ = tcpServer.ActivateAndServe() }()
+			defer udpServer.Shutdown()
+			defer tcpServer.Shutdown()
+			e := newTestEngine(t, "ALL")
+			platform := &transportTestPlatform{dnsServers: "127.0.0.1"}
+			e.platform = platform
+			unavailable := dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				// A stalled DoH must leave time for the physical DNS fallback.
+				<-request.Context().Done()
+				return nil, request.Context().Err()
+			})
+			e.dns.direct.Transport, e.dns.directFallback.Transport = unavailable, unavailable
+			ctx, cancel := context.WithTimeout(context.WithValue(e.ctx, cdnResolveKey{}, true), time.Second)
+			defer cancel()
+			addresses, err := e.dns.resolvePhysical(ctx, "abc.cdn.example.ru")
+			if err != nil || len(addresses) != 2 || addresses[0].IP.String() != "192.0.2.7" || addresses[1].IP.String() != "2001:db8::7" {
+				t.Fatalf("Physical DNS addresses = %v, %v", addresses, err)
+			}
+			wantTCP := int64(0)
+			if network == "tcp" {
+				wantTCP = 2
+			}
+			if platform.dnsCalls.Load() != 1 || udpCalls.Load() != 2 || tcpCalls.Load() != wantTCP || platform.protected.Load() != 2+wantTCP {
+				t.Fatalf("Physical DNS getter/UDP/TCP/protected = %d/%d/%d/%d; want 1/2/%d/%d", platform.dnsCalls.Load(), udpCalls.Load(), tcpCalls.Load(), platform.protected.Load(), wantTCP, 2+wantTCP)
 			}
 		})
 	}
@@ -847,6 +922,8 @@ func (c *fragmentedSniffConn) original() []byte {
 }
 
 type rejectingPlatform struct{ called chan struct{} }
+
+func (p *rejectingPlatform) PhysicalDNSServers() string { return "" }
 
 func (p *rejectingPlatform) ProtectSocket(int64) error {
 	p.called <- struct{}{}
@@ -1307,7 +1384,16 @@ func localTransportProbe(t *testing.T) {
 	t.Cleanup(func() { healthProbeURL = previous })
 }
 
-type transportTestPlatform struct{ protected atomic.Int64 }
+type transportTestPlatform struct {
+	protected  atomic.Int64
+	dnsCalls   atomic.Int64
+	dnsServers string
+}
+
+func (p *transportTestPlatform) PhysicalDNSServers() string {
+	p.dnsCalls.Add(1)
+	return p.dnsServers
+}
 
 func (p *transportTestPlatform) ProtectSocket(int64) error {
 	p.protected.Add(1)
@@ -1331,15 +1417,6 @@ func startTransportEngine(t *testing.T, points []endpoint, preferred string) *En
 	}
 	t.Cleanup(func() { _ = e.Close() })
 	return e
-}
-
-// Like the XHTTP diagnostics, this mirrors internals of the pinned Xray fork.
-// Test certificates never enter the mobile configuration or production trust.
-//
-//go:linkname xrayTestRootCerts github.com/xtls/xray-core/transport/internet/tls.rootCerts
-var xrayTestRootCerts struct {
-	sync.Mutex
-	pool *x509.CertPool
 }
 
 func localCDNEngine(t *testing.T, points []endpoint, preferred string, whitelist bool) *Engine {
@@ -1424,12 +1501,12 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 			point.Encryption = "mlkem768x25519plus.native.1rtt." + base64.RawURLEncoding.EncodeToString(kem.EncapsulationKey().Bytes()) + "." + base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes())
 			decryption = base64.RawURLEncoding.EncodeToString(kem.Bytes()) + "." + base64.RawURLEncoding.EncodeToString(key.Bytes())
 		}
-		public, private, err := ed25519.GenerateKey(rand.Reader)
+		private, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
 			t.Fatal(err)
 		}
 		certificate := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{point.ServerName}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-		der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, public, private)
+		der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, &private.PublicKey, private)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1438,20 +1515,17 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 			t.Fatal(err)
 		}
 		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-		roots := x509.NewCertPool()
-		roots.AppendCertsFromPEM(certPEM)
-		xrayTestRootCerts.Lock()
-		previousRoots := xrayTestRootCerts.pool
-		xrayTestRootCerts.pool = roots
-		xrayTestRootCerts.Unlock()
+		previousRoots := xrayTLSRootCertificates
+		xrayTLSRootCertificates = []*xtls.Certificate{{Certificate: certPEM, Usage: xtls.Certificate_AUTHORITY_VERIFY}}
 		t.Cleanup(func() {
-			xrayTestRootCerts.Lock()
-			xrayTestRootCerts.pool = previousRoots
-			xrayTestRootCerts.Unlock()
+			xrayTLSRootCertificates = previousRoots
 		})
 		security := serial.ToTypedMessage(&xtls.Config{NextProtocol: []string{"h2", "http/1.1"}, Certificate: []*xtls.Certificate{{Certificate: certPEM, Key: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})}}})
 		stream.ProtocolName = "splithttp"
-		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{Host: point.ServerName, Path: point.Path, Mode: point.Mode, UplinkHTTPMethod: point.UplinkMethod, UplinkDataPlacement: point.DataPlacement})}}
+		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{
+			Host: point.ServerName, Path: point.Path, Mode: point.Mode, UplinkHTTPMethod: point.UplinkMethod, UplinkDataPlacement: point.DataPlacement,
+			UplinkDataKey: "X-Data", ServerMaxHeaderBytes: 32 * 1024,
+		})}}
 		stream.SecurityType, stream.SecuritySettings = security.Type, []*serial.TypedMessage{security}
 	}
 	instance, err := xcore.New(&xcore.Config{

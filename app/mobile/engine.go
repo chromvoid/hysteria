@@ -25,9 +25,11 @@ import (
 	"github.com/apernet/hysteria/extras/v2/obfs"
 )
 
-// Platform protects and binds an Internet socket to the physical network before use.
+// Platform protects sockets and supplies DNS servers for the physical network.
 type Platform interface {
 	ProtectSocket(fd int64) error
+	// PhysicalDNSServers returns comma-separated IP literals, or empty if unavailable.
+	PhysicalDNSServers() string
 }
 
 type profile struct {

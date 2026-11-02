@@ -27,6 +27,7 @@ const (
 
 var fakeIPv4 = netip.MustParsePrefix("198.18.0.0/15")
 var fakeIPv6 = netip.MustParsePrefix("fc00::/18")
+var physicalDNSPort = "53"
 
 type fakeName struct {
 	domain  string
@@ -264,13 +265,31 @@ func (d *dnsResolver) resolveDirect(ctx context.Context, host string) ([]net.IPA
 	return addresses, nil
 }
 
+type cdnResolveKey struct{}
+
 func (d *dnsResolver) resolvePhysical(ctx context.Context, host string) ([]net.IPAddr, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	addresses, err := d.resolveDirect(ctx, host)
+	dohCtx := ctx
+	cancel := func() {}
+	if ctx.Value(cdnResolveKey{}) != nil {
+		timeout := 5 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			timeout = min(timeout, time.Until(deadline)/2)
+		}
+		dohCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	addresses, err := d.resolveDirect(dohCtx, host)
+	cancel()
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		addresses, err = d.resolveSystem(ctx, host)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var physical []net.IPAddr
 	for _, address := range addresses {
@@ -287,4 +306,72 @@ func (d *dnsResolver) resolvePhysical(ctx context.Context, host string) ([]net.I
 		return nil, errors.New("Could not resolve the physical network address.")
 	}
 	return physical, nil
+}
+
+// Foreign platform callbacks can fail with a panic instead of a Go error.
+func physicalDNSServers(platform Platform) (servers string) {
+	defer func() {
+		if recover() != nil {
+			servers = ""
+		}
+	}()
+	if platform != nil {
+		servers = platform.PhysicalDNSServers()
+	}
+	return
+}
+
+func (d *dnsResolver) resolveSystem(ctx context.Context, host string) ([]net.IPAddr, error) {
+	var addresses []net.IPAddr
+	for _, server := range strings.Split(physicalDNSServers(d.engine.platform), ",") {
+		ip := net.ParseIP(strings.TrimSpace(server))
+		if ip == nil {
+			continue
+		}
+		for _, recordType := range []uint16{dns.TypeA, dns.TypeAAAA} {
+			query := new(dns.Msg)
+			query.SetQuestion(dns.Fqdn(host), recordType)
+			for _, network := range []string{"udp", "tcp"} {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				timeout := time.Second
+				if deadline, ok := ctx.Deadline(); ok {
+					timeout = min(timeout, time.Until(deadline)/2)
+				}
+				client := &dns.Client{Net: network, Timeout: timeout, Dialer: &net.Dialer{Timeout: timeout, Control: d.engine.control}}
+				conn, err := client.DialContext(ctx, net.JoinHostPort(ip.String(), physicalDNSPort))
+				if err != nil {
+					continue
+				}
+				stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+				answer, _, err := client.ExchangeWithConnContext(ctx, query, conn)
+				stop()
+				_ = conn.Close()
+				if err != nil || answer.Truncated || !answer.Response || answer.Opcode != query.Opcode || len(answer.Question) != 1 ||
+					normalizedDomain(answer.Question[0].Name) != normalizedDomain(host) || answer.Question[0].Qtype != recordType || answer.Question[0].Qclass != dns.ClassINET ||
+					answer.Rcode == dns.RcodeServerFailure || answer.Rcode == dns.RcodeRefused {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					continue
+				}
+				if answer.Rcode == dns.RcodeSuccess {
+					for _, record := range answer.Answer {
+						switch record := record.(type) {
+						case *dns.A:
+							addresses = append(addresses, net.IPAddr{IP: record.A})
+						case *dns.AAAA:
+							addresses = append(addresses, net.IPAddr{IP: record.AAAA})
+						}
+					}
+				}
+				break
+			}
+		}
+		if len(addresses) > 0 {
+			return addresses, nil
+		}
+	}
+	return nil, errors.New("DNS resolution failed.")
 }
