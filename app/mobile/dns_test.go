@@ -5,8 +5,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
+	"crypto/ed25519"
+	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -14,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +31,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	_ "unsafe"
 
 	"github.com/apernet/hysteria/core/v2/client"
 	hyserver "github.com/apernet/hysteria/core/v2/server"
@@ -45,6 +50,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 	xraw "github.com/xtls/xray-core/transport/internet/tcp"
+	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 type dnsRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -1327,6 +1333,48 @@ func startTransportEngine(t *testing.T, points []endpoint, preferred string) *En
 	return e
 }
 
+// Like the XHTTP diagnostics, this mirrors internals of the pinned Xray fork.
+// Test certificates never enter the mobile configuration or production trust.
+//
+//go:linkname xrayTestRootCerts github.com/xtls/xray-core/transport/internet/tls.rootCerts
+var xrayTestRootCerts struct {
+	sync.Mutex
+	pool *x509.CertPool
+}
+
+func localCDNEngine(t *testing.T, points []endpoint, preferred string, whitelist bool) *Engine {
+	t.Helper()
+	wire, err := json.Marshal(mobileConfig{Endpoints: points, PreferredEndpoint: preferred, WhitelistMode: whitelist, Routing: "ALL", Rules: &routingRules{ProxySuffix: []string{}, DirectSuffix: []string{}, DirectDomain: []string{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := parseConfig(string(wire))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newTestEngine(t, "ALL")
+	e.config, e.platform = config, &transportTestPlatform{}
+	e.dns.direct.Transport = dnsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		wire, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		query := dnsAnswer(t, wire)
+		answer := new(dns.Msg)
+		answer.SetReply(query)
+		if query.Question[0].Qtype == dns.TypeA {
+			answer.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET}, A: net.IPv4(127, 0, 0, 1)}}
+		}
+		payload, err := answer.Pack()
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(payload)), Header: make(http.Header)}, err
+	})
+	e.dns.directFallback.Transport = e.dns.direct.Transport
+	if err := e.connect(""); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
 func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance) {
 	t.Helper()
 	dest := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
@@ -1362,6 +1410,50 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 			PrivateKey: key.Bytes(), ShortIds: [][]byte{{1, 35, 69, 103, 137, 171, 205, 239}},
 		})},
 	}
+	decryption := "none"
+	if kind == "vless_xhttp_cdn" {
+		point.Server, point.ServerName = "localhost", "localhost"
+		point.PublicKey, point.ShortID, point.Flow = "", "", ""
+		point.Path, point.Mode = "/wayveil-cdn-test/", "packet-up"
+		point.UplinkMethod, point.DataPlacement, point.MaxPostBytes, point.Encryption = "GET", "header", 8192, "none"
+		if flow == "mlkem768x25519plus" {
+			kem, err := mlkem.GenerateKey768()
+			if err != nil {
+				t.Fatal(err)
+			}
+			point.Encryption = "mlkem768x25519plus.native.1rtt." + base64.RawURLEncoding.EncodeToString(kem.EncapsulationKey().Bytes()) + "." + base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes())
+			decryption = base64.RawURLEncoding.EncodeToString(kem.Bytes()) + "." + base64.RawURLEncoding.EncodeToString(key.Bytes())
+		}
+		public, private, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certificate := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{point.ServerName}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+		der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, public, private)
+		if err != nil {
+			t.Fatal(err)
+		}
+		privateDER, err := x509.MarshalPKCS8PrivateKey(private)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		roots := x509.NewCertPool()
+		roots.AppendCertsFromPEM(certPEM)
+		xrayTestRootCerts.Lock()
+		previousRoots := xrayTestRootCerts.pool
+		xrayTestRootCerts.pool = roots
+		xrayTestRootCerts.Unlock()
+		t.Cleanup(func() {
+			xrayTestRootCerts.Lock()
+			xrayTestRootCerts.pool = previousRoots
+			xrayTestRootCerts.Unlock()
+		})
+		security := serial.ToTypedMessage(&xtls.Config{NextProtocol: []string{"h2", "http/1.1"}, Certificate: []*xtls.Certificate{{Certificate: certPEM, Key: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})}}})
+		stream.ProtocolName = "splithttp"
+		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{Host: point.ServerName, Path: point.Path, Mode: point.Mode, UplinkHTTPMethod: point.UplinkMethod, UplinkDataPlacement: point.DataPlacement})}}
+		stream.SecurityType, stream.SecuritySettings = security.Type, []*serial.TypedMessage{security}
+	}
 	instance, err := xcore.New(&xcore.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
@@ -1374,7 +1466,7 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 				PortList:       &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(xnet.Port(port))}},
 				StreamSettings: stream,
 			}),
-			ProxySettings: serial.ToTypedMessage(&vlessin.Config{Decryption: "none", Clients: []*protocol.User{{Account: serial.ToTypedMessage(&vless.Account{Id: point.UUID, Flow: flow})}}}),
+			ProxySettings: serial.ToTypedMessage(&vlessin.Config{Decryption: decryption, Clients: []*protocol.User{{Account: serial.ToTypedMessage(&vless.Account{Id: point.UUID, Flow: point.Flow})}}}),
 		}},
 		Outbound: []*xcore.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{})}},
 	})
@@ -1535,6 +1627,37 @@ func assertTransportEcho(t *testing.T, e *Engine, sharedHTTP2 bool) {
 
 func TestXrayTransportEcho(t *testing.T) {
 	localTransportProbe(t)
+	for _, encryption := range []string{"none", "mlkem768x25519plus"} {
+		t.Run("cdn-"+encryption, func(t *testing.T) {
+			if raceEnabled {
+				t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
+			}
+			point, _ := localXrayServer(t, "vless_xhttp_cdn", encryption)
+			e := localCDNEngine(t, []endpoint{point}, "", true)
+			if e.ActiveEndpoint() != point.ID || e.platform.(*transportTestPlatform).protected.Load() == 0 {
+				t.Fatal("The CDN endpoint must use protected sockets")
+			}
+			ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
+			defer cancel()
+			if err := probeEndpoint(ctx, e.hy); err != nil {
+				t.Fatalf("CDN 64 KiB probe: %v", err)
+			}
+			if milliseconds, err := e.Ping(); err != nil || milliseconds < 1 {
+				t.Fatalf("CDN Ping = %d ms, %v", milliseconds, err)
+			}
+			assertTransportEcho(t, e, true)
+			rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadGateway)
+			}))
+			defer rejected.Close()
+			previousProbe := healthProbeURL
+			healthProbeURL = rejected.URL
+			defer func() { healthProbeURL = previousProbe }()
+			if _, err := e.Ping(); err == nil {
+				t.Fatal("CDN Ping accepted a failed request through the outbound")
+			}
+		})
+	}
 	for _, tc := range []struct {
 		name, kind, flow string
 		mux              bool
@@ -1754,6 +1877,37 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 			}
 		}
 		return attempts
+	}
+	for _, whitelist := range []bool{false, true} {
+		t.Run(fmt.Sprintf("whitelist-mode-%t", whitelist), func(t *testing.T) {
+			if raceEnabled {
+				t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
+			}
+			cdn, _ := localXrayServer(t, "vless_xhttp_cdn", "none")
+			reality, _ := localXrayServer(t, "vless_reality", "")
+			selected, skipped := reality, cdn
+			if whitelist {
+				selected, skipped = cdn, reality
+			}
+			// Prefer the first, excluded endpoint to verify that mode filtering
+			// applies before both preference ordering and reconnect ordering.
+			e := localCDNEngine(t, []endpoint{skipped, selected}, skipped.ID, whitelist)
+			if e.ActiveEndpoint() != selected.ID {
+				t.Fatalf("Initial endpoint = %q, want %q", e.ActiveEndpoint(), selected.ID)
+			}
+			assertReport(t, []endpoint{selected}, []string{"ok"})
+			if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != selected.ID {
+				t.Fatalf("Reconnect endpoint = %q, %v; want %q", e.ActiveEndpoint(), err, selected.ID)
+			}
+			assertReport(t, []endpoint{selected}, []string{"ok"})
+			if !e.TrySwitch(skipped.ID) || e.ActiveEndpoint() != skipped.ID {
+				t.Fatalf("TrySwitch did not select the endpoint excluded by mode: %q", e.ActiveEndpoint())
+			}
+			if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != selected.ID {
+				t.Fatalf("Reconnect after TrySwitch = %q, %v; want %q", e.ActiveEndpoint(), err, selected.ID)
+			}
+			assertReport(t, []endpoint{selected}, []string{"ok"})
+		})
 	}
 	t.Run("unreachable-hysteria", func(t *testing.T) {
 		point, _ := localXrayServer(t, "vless_reality", "")
@@ -2547,6 +2701,87 @@ func TestLegacyHysteriaTransport(t *testing.T) {
 func TestEndpointValidation(t *testing.T) {
 	valid := endpoint{ID: "reality", Kind: "vless_reality", Server: "127.0.0.1", Port: 443, ServerName: "example.com", UUID: "42d47e34-d5bd-4caf-bc15-947895415293", PublicKey: "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM", ShortID: "0123456789abcdef"}
 	hysteria := endpoint{ID: "hysteria2", Kind: "hysteria2", Server: "127.0.0.1", Port: 443, ServerName: "example.com", Password: "ticket"}
+	t.Run("cdn", func(t *testing.T) {
+		cdn := endpoint{ID: "cdn", Kind: "vless_xhttp_cdn", Server: "abc.cdn.example.ru", Port: 443,
+			ServerName: "abc.cdn.example.ru", UUID: valid.UUID, Path: "/s3cr3t/", Mode: "packet-up"}
+		parsed, err := parseConfig(transportConfigJSON(t, []endpoint{cdn}, ""))
+		if err != nil || len(parsed.Endpoints) != 1 {
+			t.Fatalf("CDN defaults rejected: %+v, %v", parsed.Endpoints, err)
+		}
+		got := parsed.Endpoints[0]
+		if got.Fingerprint != "firefox" || got.UplinkMethod != "GET" || got.DataPlacement != "header" || got.MaxPostBytes != 8192 || got.Encryption != "none" {
+			t.Fatalf("CDN defaults = %+v", got)
+		}
+		for _, method := range []string{"GET", "POST", "PUT"} {
+			for _, placement := range []string{"header", "cookie", "body"} {
+				if method == "GET" && placement == "body" {
+					continue
+				}
+				point := cdn
+				point.UplinkMethod, point.DataPlacement = method, placement
+				if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
+					t.Fatalf("CDN %s/%s rejected: %v", method, placement, err)
+				}
+			}
+		}
+		for _, size := range []int{1024, 1048576} {
+			point := cdn
+			point.MaxPostBytes, point.Path = size, "/"+strings.Repeat("x", 127)
+			point.Encryption = "mlkem768x25519plus." + strings.Repeat("x", 2048-len("mlkem768x25519plus."))
+			if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
+				t.Fatalf("CDN limits rejected: %v", err)
+			}
+		}
+		for _, tc := range []struct {
+			name, field string
+			value       any
+		}{
+			{"server-ipv4", "server", "192.0.2.1"},
+			{"server-ipv6", "server", "2001:db8::1"},
+			{"sni-ipv4", "server_name", "192.0.2.1"},
+			{"sni-ipv6", "server_name", "2001:db8::1"},
+			{"sni-required", "server_name", ""},
+			{"sni-port", "server_name", "cdn.example:443"},
+			{"public-key-presence", "public_key", ""},
+			{"short-id-presence", "short_id", nil},
+			{"flow-presence", "flow", ""},
+			{"mux-presence", "mux", false},
+			{"foreign-field", "password", "ticket"},
+			{"path-relative", "path", "s3cr3t/"},
+			{"path-long", "path", "/" + strings.Repeat("x", 128)},
+			{"mode-auto", "mode", "auto"},
+			{"mode-stream", "mode", "stream-up"},
+			{"get-body", "data_placement", "body"},
+			{"method", "uplink_method", "HEAD"},
+			{"placement", "data_placement", "query"},
+			{"size-zero", "max_post_bytes", 0},
+			{"size-low", "max_post_bytes", 1023},
+			{"size-high", "max_post_bytes", 1048577},
+			{"size-fraction", "max_post_bytes", 8192.5},
+			{"encryption", "encryption", "unsupported"},
+			{"encryption-long", "encryption", "mlkem768x25519plus." + strings.Repeat("x", 2049-len("mlkem768x25519plus."))},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				pointJSON, err := json.Marshal(cdn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var fields map[string]any
+				if err := json.Unmarshal(pointJSON, &fields); err != nil {
+					t.Fatal(err)
+				}
+				fields[tc.field] = tc.value
+				wire, err := json.Marshal(map[string]any{"endpoints": []any{fields, valid}, "routing": "ALL", "rules": map[string]any{}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				parsed, err := parseConfig(string(wire))
+				if err != nil || len(parsed.Endpoints) != 1 || parsed.Endpoints[0].ID != valid.ID {
+					t.Fatalf("Invalid CDN endpoint was not dropped: %+v, %v", parsed.Endpoints, err)
+				}
+			})
+		}
+	})
 	for _, tc := range []struct {
 		name   string
 		change func(*endpoint)

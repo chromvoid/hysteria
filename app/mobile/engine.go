@@ -45,6 +45,7 @@ type mobileConfig struct {
 	Profile           profile       `json:"profile"`
 	Endpoints         []endpoint    `json:"endpoints"`
 	PreferredEndpoint string        `json:"preferred_endpoint"`
+	WhitelistMode     bool          `json:"whitelist_mode"`
 	Routing           string        `json:"routing"`
 	Rules             *routingRules `json:"rules"`
 }
@@ -219,18 +220,24 @@ func (e *Engine) connect(first string) error {
 	ctx, cancel := context.WithTimeout(e.ctx, connectTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, connectDeadlineKey{}, deadline)
-	endpoints := make([]endpoint, 0, len(e.config.Endpoints))
+	points := make([]endpoint, 0, len(e.config.Endpoints))
 	for _, p := range e.config.Endpoints {
+		if (p.Kind == "vless_xhttp_cdn") == e.config.WhitelistMode {
+			points = append(points, p)
+		}
+	}
+	endpoints := make([]endpoint, 0, len(e.config.Endpoints))
+	for _, p := range points {
 		if p.ID == first {
 			endpoints = append(endpoints, p)
 		}
 	}
-	for _, p := range e.config.Endpoints {
+	for _, p := range points {
 		if p.ID == e.config.PreferredEndpoint && p.ID != first {
 			endpoints = append(endpoints, p)
 		}
 	}
-	for _, p := range e.config.Endpoints {
+	for _, p := range points {
 		if p.ID != first && p.ID != e.config.PreferredEndpoint {
 			endpoints = append(endpoints, p)
 		}
@@ -425,7 +432,7 @@ func (e *Engine) Check() error {
 	return nil
 }
 
-// Ping measures a TCP open through the current VPN transport without sending payload.
+// Ping measures a TCP open, or a data transfer check for CDN transports.
 func (e *Engine) Ping() (int64, error) {
 	e.mu.RLock()
 	hy, closed := e.hy, e.closed
@@ -438,6 +445,13 @@ func (e *Engine) Ping() (int64, error) {
 	}
 	ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
 	defer cancel()
+	if transport, ok := hy.(*xrayTransport); ok && transport.ping == nil {
+		started := time.Now()
+		if err := probeEndpoint(ctx, hy); err != nil {
+			return 0, errors.New("The VPN latency check failed.")
+		}
+		return max(1, int64((time.Since(started)+time.Millisecond-1)/time.Millisecond)), nil
+	}
 	dial := hy.TCPContext
 	if transport, ok := hy.(interface {
 		PingTCPContext(context.Context, string) (net.Conn, error)
@@ -592,7 +606,7 @@ func (e *Engine) DownloadPeakBps() int64 {
 	return e.download.peak.Load()
 }
 
-func Version() string { return "Hysteria2 2.13.0 / Wayveil HEV" }
+func Version() string { return "Hysteria2 2.13.0 / Wayveil HEV 2" }
 
 const minimumDownloadBytes = 64 * 1024
 
