@@ -1530,7 +1530,9 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 		stream.ProtocolName = "splithttp"
 		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{
 			Host: point.ServerName, Path: point.Path, Mode: point.Mode, UplinkHTTPMethod: point.UplinkMethod, UplinkDataPlacement: point.DataPlacement,
-			UplinkDataKey: "X-Data", ServerMaxHeaderBytes: 32 * 1024,
+			UplinkDataKey: "X-Data",
+			// Match kaifaty/infra@d1a9a65: ansible/roles/vpn_node/templates/xray.json.j2.
+			ServerMaxHeaderBytes: 64 * 1024,
 		})}}
 		stream.SecurityType, stream.SecuritySettings = security.Type, []*serial.TypedMessage{security}
 		roots := x509.NewCertPool()
@@ -1546,6 +1548,31 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 				t.Errorf("Invalid CDN request: method=%s host=%s uplink=%t", r.Method, r.Host, uplink)
 				http.Error(w, "Invalid CDN request.", http.StatusBadRequest)
 				return
+			}
+			if uplink {
+				headers := r.Header.Clone()
+				// Host lives outside Header; include it once as HTTP/2 :authority.
+				headers[":method"] = []string{r.Method}
+				headers[":scheme"] = []string{"https"}
+				headers[":authority"] = []string{r.Host}
+				headers[":path"] = []string{r.RequestURI}
+				headerBytes := 0
+				for name, values := range headers {
+					for _, value := range values {
+						if lineBytes := len(name) + len(value) + 4; lineBytes > 32*1024 {
+							t.Errorf("CDN uplink header %s uses %d bytes, limit 32768", name, lineBytes)
+							http.Error(w, "CDN header is too large.", http.StatusRequestHeaderFieldsTooLarge)
+							return
+						}
+						// HTTP/2 counts 32 additional bytes per uncompressed field.
+						headerBytes += len(name) + len(value) + 32
+					}
+				}
+				if headerBytes > 64*1024 {
+					t.Errorf("CDN uplink headers use %d bytes, limit 65536", headerBytes)
+					http.Error(w, "CDN headers are too large.", http.StatusRequestHeaderFieldsTooLarge)
+					return
+				}
 			}
 			proxy.ServeHTTP(w, r)
 		}))
@@ -1738,6 +1765,7 @@ func TestXrayTransportEcho(t *testing.T) {
 				t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
 			}
 			point, _ := localXrayServer(t, "vless_xhttp_cdn", encryption)
+			point.UplinkMethod, point.DataPlacement, point.MaxPostBytes = "", "", 0
 			before := probes.Load()
 			e := localCDNEngine(t, []endpoint{point}, "", true)
 			if count := probes.Load() - before; count != 1 {
@@ -2841,9 +2869,12 @@ func TestEndpointValidation(t *testing.T) {
 				}
 			}
 		}
-		for _, size := range []int{1024, 1048576} {
+		for _, size := range []int{1024, 32768, 1048576} {
 			point := cdn
 			point.MaxPostBytes, point.Path = size, "/"+strings.Repeat("x", 127)
+			if size == 1048576 {
+				point.UplinkMethod, point.DataPlacement = "POST", "body"
+			}
 			point.Encryption = "mlkem768x25519plus." + strings.Repeat("x", 2048-len("mlkem768x25519plus."))
 			if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
 				t.Fatalf("CDN limits rejected: %v", err)
@@ -2874,6 +2905,7 @@ func TestEndpointValidation(t *testing.T) {
 			{"size-zero", "max_post_bytes", 0},
 			{"size-low", "max_post_bytes", 1023},
 			{"size-high", "max_post_bytes", 1048577},
+			{"size-header-high", "max_post_bytes", 1048576},
 			{"size-fraction", "max_post_bytes", 8192.5},
 			{"encryption", "encryption", "unsupported"},
 			{"encryption-long", "encryption", "mlkem768x25519plus." + strings.Repeat("x", 2049-len("mlkem768x25519plus."))},

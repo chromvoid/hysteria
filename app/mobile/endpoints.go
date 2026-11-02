@@ -277,6 +277,10 @@ func (p *endpoint) validateVLESS() error {
 		if p.MaxPostBytes < 1024 || p.MaxPostBytes > 1048576 {
 			return endpointFieldError("max_post_bytes", "must be between 1024 and 1048576")
 		}
+		// Leave room for base64 expansion, padding and metadata within 64 KiB of headers.
+		if p.DataPlacement == "header" && p.MaxPostBytes > 32768 {
+			return endpointFieldError("max_post_bytes", "must not exceed 32768 with header placement")
+		}
 		if p.Encryption == "" {
 			p.Encryption = "none"
 		}
