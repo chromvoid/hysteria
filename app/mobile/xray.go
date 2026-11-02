@@ -175,11 +175,7 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 		_ = t.Close()
 		return nil, err
 	}
-	if ping == nil {
-		// A CDN entry must carry data through TLS, XHTTP and VLESS; a raw
-		// connection to its edge cannot verify the origin transport.
-		err = probeEndpoint(ctx, t)
-	} else {
+	if ping != nil {
 		// Construction starts no network handshake. Verify REALITY here so a
 		// failed entry handshake is distinct from the subsequent data probe.
 		// Match VLESS outbound's five attempts and 0/200/400/600 ms retry delays,

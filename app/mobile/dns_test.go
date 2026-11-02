@@ -22,7 +22,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1372,9 +1374,11 @@ func TestConcurrentProxyReadAccounting(t *testing.T) {
 }
 
 // The probe and all proxy destinations stay on loopback, including REALITY's TLS target.
-func localTransportProbe(t *testing.T) {
+func localTransportProbe(t *testing.T) *atomic.Int64 {
 	t.Helper()
+	requests := new(atomic.Int64)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
 		w.Header().Set("Content-Length", "65536")
 		_, _ = w.Write(bytes.Repeat([]byte("p"), 65536))
 	}))
@@ -1382,6 +1386,7 @@ func localTransportProbe(t *testing.T) {
 	previous := healthProbeURL
 	healthProbeURL = server.URL + "/__down?bytes=65536"
 	t.Cleanup(func() { healthProbeURL = previous })
+	return requests
 }
 
 type transportTestPlatform struct {
@@ -1489,7 +1494,7 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 	}
 	decryption := "none"
 	if kind == "vless_xhttp_cdn" {
-		point.Server, point.ServerName = "localhost", "localhost"
+		point.Server, point.ServerName = "cdn-edge.example.test", "cdn-origin.example.test"
 		point.PublicKey, point.ShortID, point.Flow = "", "", ""
 		point.Path, point.Mode = "/wayveil-cdn-test/", "packet-up"
 		point.UplinkMethod, point.DataPlacement, point.MaxPostBytes, point.Encryption = "GET", "header", 8192, "none"
@@ -1515,18 +1520,44 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 			t.Fatal(err)
 		}
 		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})
 		previousRoots := xrayTLSRootCertificates
 		xrayTLSRootCertificates = []*xtls.Certificate{{Certificate: certPEM, Usage: xtls.Certificate_AUTHORITY_VERIFY}}
 		t.Cleanup(func() {
 			xrayTLSRootCertificates = previousRoots
 		})
-		security := serial.ToTypedMessage(&xtls.Config{NextProtocol: []string{"h2", "http/1.1"}, Certificate: []*xtls.Certificate{{Certificate: certPEM, Key: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})}}})
+		security := serial.ToTypedMessage(&xtls.Config{NextProtocol: []string{"h2", "http/1.1"}, Certificate: []*xtls.Certificate{{Certificate: certPEM, Key: keyPEM}}})
 		stream.ProtocolName = "splithttp"
 		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{
 			Host: point.ServerName, Path: point.Path, Mode: point.Mode, UplinkHTTPMethod: point.UplinkMethod, UplinkDataPlacement: point.DataPlacement,
 			UplinkDataKey: "X-Data", ServerMaxHeaderBytes: 32 * 1024,
 		})}}
 		stream.SecurityType, stream.SecuritySettings = security.Type, []*serial.TypedMessage{security}
+		roots := x509.NewCertPool()
+		roots.AppendCertsFromPEM(certPEM)
+		proxyTransport := &http.Transport{ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: point.ServerName}}
+		t.Cleanup(proxyTransport.CloseIdleConnections)
+		proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "https", Host: net.JoinHostPort("127.0.0.1", fmt.Sprint(port))})
+		proxy.Transport = proxyTransport
+		edge := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			uplink := strings.Contains(strings.TrimPrefix(r.URL.Path, point.Path), "/")
+			if r.TLS == nil || r.TLS.ServerName != point.ServerName || r.Host != point.ServerName || r.Method != http.MethodGet ||
+				(uplink && (r.Header.Get("X-Data-0") == "" || r.ContentLength != 0)) {
+				t.Errorf("Invalid CDN request: method=%s host=%s uplink=%t", r.Method, r.Host, uplink)
+				http.Error(w, "Invalid CDN request.", http.StatusBadRequest)
+				return
+			}
+			proxy.ServeHTTP(w, r)
+		}))
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		edge.EnableHTTP2 = true
+		edge.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+		edge.StartTLS()
+		t.Cleanup(edge.Close)
+		point.Port = edge.Listener.Addr().(*net.TCPAddr).Port
 	}
 	instance, err := xcore.New(&xcore.Config{
 		App: []*serial.TypedMessage{
@@ -1700,14 +1731,18 @@ func assertTransportEcho(t *testing.T, e *Engine, sharedHTTP2 bool) {
 }
 
 func TestXrayTransportEcho(t *testing.T) {
-	localTransportProbe(t)
+	probes := localTransportProbe(t)
 	for _, encryption := range []string{"none", "mlkem768x25519plus"} {
 		t.Run("cdn-"+encryption, func(t *testing.T) {
 			if raceEnabled {
 				t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
 			}
 			point, _ := localXrayServer(t, "vless_xhttp_cdn", encryption)
+			before := probes.Load()
 			e := localCDNEngine(t, []endpoint{point}, "", true)
+			if count := probes.Load() - before; count != 1 {
+				t.Fatalf("CDN connect made %d data probes, want one", count)
+			}
 			if e.ActiveEndpoint() != point.ID || e.platform.(*transportTestPlatform).protected.Load() == 0 {
 				t.Fatal("The CDN endpoint must use protected sockets")
 			}
@@ -1922,7 +1957,7 @@ func TestXrayRejectsWrongUUID(t *testing.T) {
 }
 
 func TestEndpointSelectionAndReconnect(t *testing.T) {
-	localTransportProbe(t)
+	probes := localTransportProbe(t)
 	assertReport := func(t *testing.T, points []endpoint, stages []string) []endpointAttempt {
 		t.Helper()
 		report := LastStartReport()
@@ -1965,7 +2000,11 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 			}
 			// Prefer the first, excluded endpoint to verify that mode filtering
 			// applies before both preference ordering and reconnect ordering.
+			before := probes.Load()
 			e := localCDNEngine(t, []endpoint{skipped, selected}, skipped.ID, whitelist)
+			if count := probes.Load() - before; count != 1 {
+				t.Fatalf("Connect made %d data probes, want one", count)
+			}
 			if e.ActiveEndpoint() != selected.ID {
 				t.Fatalf("Initial endpoint = %q, want %q", e.ActiveEndpoint(), selected.ID)
 			}
@@ -1974,8 +2013,12 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 				t.Fatalf("Reconnect endpoint = %q, %v; want %q", e.ActiveEndpoint(), err, selected.ID)
 			}
 			assertReport(t, []endpoint{selected}, []string{"ok"})
+			before = probes.Load()
 			if !e.TrySwitch(skipped.ID) || e.ActiveEndpoint() != skipped.ID {
 				t.Fatalf("TrySwitch did not select the endpoint excluded by mode: %q", e.ActiveEndpoint())
+			}
+			if count := probes.Load() - before; count != 1 {
+				t.Fatalf("TrySwitch made %d data probes, want one", count)
 			}
 			if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != selected.ID {
 				t.Fatalf("Reconnect after TrySwitch = %q, %v; want %q", e.ActiveEndpoint(), err, selected.ID)
