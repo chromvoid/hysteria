@@ -38,6 +38,12 @@ type endpoint struct {
 
 var errInvalidEndpoint = errors.New("Invalid VPN endpoint configuration")
 
+// Xray's minimum cookie chunk is 2048 encoded bytes: 24433 payload bytes become
+// 32578 base64 bytes in at most 16 x_data_N cookies. Names and '=' take 150 bytes,
+// '; ' separators take 30, and "Cookie: " plus CRLF take 10: exactly 32768 bytes.
+// One more payload byte would require a 32769-byte line.
+const maximumCDNCookiePostBytes = 24433
+
 func endpointFieldError(field, reason string) error {
 	return fmt.Errorf("%w: %s %s.", errInvalidEndpoint, field, reason)
 }
@@ -280,6 +286,9 @@ func (p *endpoint) validateVLESS() error {
 		// Leave room for base64 expansion, padding and metadata within 64 KiB of headers.
 		if p.DataPlacement == "header" && p.MaxPostBytes > 32768 {
 			return endpointFieldError("max_post_bytes", "must not exceed 32768 with header placement")
+		}
+		if p.DataPlacement == "cookie" && p.MaxPostBytes > maximumCDNCookiePostBytes {
+			return endpointFieldError("max_post_bytes", fmt.Sprintf("must not exceed %d with cookie placement", maximumCDNCookiePostBytes))
 		}
 		if p.Encryption == "" {
 			p.Encryption = "none"

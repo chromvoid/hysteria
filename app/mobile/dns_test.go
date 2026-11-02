@@ -1498,6 +1498,9 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 		point.PublicKey, point.ShortID, point.Flow = "", "", ""
 		point.Path, point.Mode = "/wayveil-cdn-test/", "packet-up"
 		point.UplinkMethod, point.DataPlacement, point.MaxPostBytes, point.Encryption = "GET", "header", 8192, "none"
+		if flow == "cookie" {
+			point.DataPlacement, point.MaxPostBytes = "cookie", maximumCDNCookiePostBytes
+		}
 		if flow == "mlkem768x25519plus" {
 			kem, err := mlkem.GenerateKey768()
 			if err != nil {
@@ -1528,9 +1531,13 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 		})
 		security := serial.ToTypedMessage(&xtls.Config{NextProtocol: []string{"h2", "http/1.1"}, Certificate: []*xtls.Certificate{{Certificate: certPEM, Key: keyPEM}}})
 		stream.ProtocolName = "splithttp"
+		dataKey := "X-Data"
+		if point.DataPlacement == "cookie" {
+			dataKey = "x_data"
+		}
 		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{
 			Host: point.ServerName, Path: point.Path, Mode: point.Mode, UplinkHTTPMethod: point.UplinkMethod, UplinkDataPlacement: point.DataPlacement,
-			UplinkDataKey: "X-Data",
+			UplinkDataKey: dataKey,
 			// Match kaifaty/infra@d1a9a65: ansible/roles/vpn_node/templates/xray.json.j2.
 			ServerMaxHeaderBytes: 64 * 1024,
 		})}}
@@ -1543,13 +1550,27 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 		proxy.Transport = proxyTransport
 		edge := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			uplink := strings.Contains(strings.TrimPrefix(r.URL.Path, point.Path), "/")
+			payloadPresent := r.Header.Get("X-Data-0") != ""
+			if point.DataPlacement == "cookie" {
+				cookie, err := r.Cookie("x_data_0")
+				payloadPresent = err == nil && cookie.Value != ""
+			}
 			if r.TLS == nil || r.TLS.ServerName != point.ServerName || r.Host != point.ServerName || r.Method != http.MethodGet ||
-				(uplink && (r.Header.Get("X-Data-0") == "" || r.ContentLength != 0)) {
+				(uplink && (!payloadPresent || r.ContentLength != 0)) {
 				t.Errorf("Invalid CDN request: method=%s host=%s uplink=%t", r.Method, r.Host, uplink)
 				http.Error(w, "Invalid CDN request.", http.StatusBadRequest)
 				return
 			}
 			if uplink {
+				if point.DataPlacement == "cookie" {
+					// HTTP/2 may split Cookie fields; nginx receives their joined line.
+					cookie := strings.Join(r.Header.Values("Cookie"), "; ")
+					if lineBytes := len("Cookie: ") + len(cookie) + len("\r\n"); lineBytes > 32*1024 {
+						t.Errorf("CDN uplink Cookie line uses %d bytes, limit 32768", lineBytes)
+						http.Error(w, "CDN Cookie is too large.", http.StatusRequestHeaderFieldsTooLarge)
+						return
+					}
+				}
 				headers := r.Header.Clone()
 				// Host lives outside Header; include it once as HTTP/2 :authority.
 				headers[":method"] = []string{r.Method}
@@ -1759,13 +1780,25 @@ func assertTransportEcho(t *testing.T, e *Engine, sharedHTTP2 bool) {
 
 func TestXrayTransportEcho(t *testing.T) {
 	probes := localTransportProbe(t)
-	for _, encryption := range []string{"none", "mlkem768x25519plus"} {
-		t.Run("cdn-"+encryption, func(t *testing.T) {
+	for _, variant := range []string{"none", "mlkem768x25519plus", "cookie"} {
+		t.Run("cdn-"+variant, func(t *testing.T) {
 			if raceEnabled {
 				t.Skip("Upstream Xray XHTTP WaitReadCloser.Set/Read races under -race (transport/internet/splithttp/client.go).")
 			}
-			point, _ := localXrayServer(t, "vless_xhttp_cdn", encryption)
-			point.UplinkMethod, point.DataPlacement, point.MaxPostBytes = "", "", 0
+			point, _ := localXrayServer(t, "vless_xhttp_cdn", variant)
+			if variant != "cookie" {
+				point.UplinkMethod, point.DataPlacement, point.MaxPostBytes = "", "", 0
+			} else {
+				// Minimum chunks maximize cookie names and separators on the joined line.
+				config := &splithttp.Config{UplinkDataKey: "x_data", UplinkChunkSize: &splithttp.RangeConfig{From: 2048, To: 2048}}
+				request := &http.Request{Header: make(http.Header)}
+				for _, cookie := range config.GetRequestCookiesWithPayload(make([]byte, maximumCDNCookiePostBytes)) {
+					request.AddCookie(cookie)
+				}
+				if size := len("Cookie: ") + len(request.Header.Get("Cookie")) + len("\r\n"); size != 32*1024 {
+					t.Fatalf("Boundary Cookie line uses %d bytes, want 32768", size)
+				}
+			}
 			before := probes.Load()
 			e := localCDNEngine(t, []endpoint{point}, "", true)
 			if count := probes.Load() - before; count != 1 {
@@ -2867,6 +2900,14 @@ func TestEndpointValidation(t *testing.T) {
 				if err := Validate(transportConfigJSON(t, []endpoint{point}, "")); err != nil {
 					t.Fatalf("CDN %s/%s rejected: %v", method, placement, err)
 				}
+			}
+		}
+		for _, size := range []int{maximumCDNCookiePostBytes, maximumCDNCookiePostBytes + 1} {
+			point := cdn
+			point.DataPlacement, point.MaxPostBytes = "cookie", size
+			err := Validate(transportConfigJSON(t, []endpoint{point}, ""))
+			if (err == nil) != (size == maximumCDNCookiePostBytes) {
+				t.Fatalf("Cookie max_post_bytes %d validation = %v", size, err)
 			}
 		}
 		for _, size := range []int{1024, 32768, 1048576} {
