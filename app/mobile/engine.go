@@ -404,9 +404,14 @@ func (e *Engine) SocksPort() int64 {
 	return int64(e.listener.Addr().(*net.TCPAddr).Port)
 }
 
+// HEV's own default task stack. A 64-datagram UDP send batch puts about 24 KiB of
+// headers and iovecs on the stack, which overflowed the 24 KiB low-memory size and
+// crashed the packet thread. Stacks are mapped lazily, so unused pages cost nothing.
+const hevTaskStackSize = 86016
+
 // HEVConfig contains only local packet-adapter settings, never server credentials.
 func (e *Engine) HEVConfig() string {
-	return fmt.Sprintf("tunnel:\n  name: wayveil\n  mtu: 1400\n  ipv4: 172.19.0.1\n  ipv6: 'fdfe:dcba:9876::1'\nsocks5:\n  address: 127.0.0.1\n  port: %d\n  udp: udp\nmisc:\n  task-stack-size: 24576\n  tcp-buffer-size: 4096\n  max-session-count: 512\n  connect-timeout: 10000\n  tcp-read-write-timeout: 300000\n  udp-read-write-timeout: 60000\n  log-file: /dev/null\n  log-level: error\n", e.SocksPort())
+	return fmt.Sprintf("tunnel:\n  name: wayveil\n  mtu: 1400\n  ipv4: 172.19.0.1\n  ipv6: 'fdfe:dcba:9876::1'\nsocks5:\n  address: 127.0.0.1\n  port: %d\n  udp: udp\nmisc:\n  task-stack-size: %d\n  tcp-buffer-size: 4096\n  max-session-count: 512\n  connect-timeout: 10000\n  tcp-read-write-timeout: 300000\n  udp-read-write-timeout: 60000\n  log-file: /dev/null\n  log-level: error\n", e.SocksPort(), hevTaskStackSize)
 }
 
 // Check verifies fresh HTTPS over the active transport, independent of bypass rules.
