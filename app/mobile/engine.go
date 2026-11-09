@@ -11,7 +11,9 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,7 +104,7 @@ type vpnTransport interface {
 
 // Engine runs the selected VPN transport and a loopback SOCKS5 endpoint for HEV.
 type Engine struct {
-	config   mobileConfig
+	config   mobileConfig // Guarded by mu after Start; read it with snapshot.
 	platform Platform
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -222,25 +224,26 @@ func (e *Engine) connect(first string) error {
 	ctx, cancel := context.WithTimeout(e.ctx, connectTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, connectDeadlineKey{}, deadline)
-	points := make([]endpoint, 0, len(e.config.Endpoints))
-	for _, p := range e.config.Endpoints {
-		if (p.Kind == "vless_xhttp_cdn") == e.config.WhitelistMode {
+	config := e.snapshot()
+	points := make([]endpoint, 0, len(config.Endpoints))
+	for _, p := range config.Endpoints {
+		if (p.Kind == "vless_xhttp_cdn") == config.WhitelistMode {
 			points = append(points, p)
 		}
 	}
-	endpoints := make([]endpoint, 0, len(e.config.Endpoints))
+	endpoints := make([]endpoint, 0, len(config.Endpoints))
 	for _, p := range points {
 		if p.ID == first {
 			endpoints = append(endpoints, p)
 		}
 	}
 	for _, p := range points {
-		if p.ID == e.config.PreferredEndpoint && p.ID != first {
+		if p.ID == config.PreferredEndpoint && p.ID != first {
 			endpoints = append(endpoints, p)
 		}
 	}
 	for _, p := range points {
-		if p.ID != first && p.ID != e.config.PreferredEndpoint {
+		if p.ID != first && p.ID != config.PreferredEndpoint {
 			endpoints = append(endpoints, p)
 		}
 	}
@@ -509,13 +512,13 @@ func (e *Engine) TrySwitch(id string) bool {
 	}
 	defer e.switching.Store(false)
 	e.mu.RLock()
-	closed, active, gen := e.closed, e.activeID, e.generation.Load()
+	closed, active, gen, config := e.closed, e.activeID, e.generation.Load(), e.config
 	e.mu.RUnlock()
 	if closed || active == "" || active == id {
 		return false
 	}
 	var point endpoint
-	for _, p := range e.config.Endpoints {
+	for _, p := range config.Endpoints {
 		if p.ID == id {
 			point = p
 			break
@@ -563,6 +566,52 @@ func (e *Engine) TrySwitch(id string) bool {
 	}
 	e.dns.close()
 	return true
+}
+
+// snapshot returns the whole configuration as one consistent value. Refresh
+// replaces the configuration but never modifies a published one in place.
+func (e *Engine) snapshot() mobileConfig {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.config
+}
+
+// rules returns the routing rules, which Refresh never changes.
+func (e *Engine) rules() *routingRules {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.config.Rules
+}
+
+var errRefreshChanged = errors.New("The refreshed VPN configuration changes more than endpoint passwords. Restart the VPN to apply it.")
+
+// Refresh replaces endpoint passwords for future Reconnect and TrySwitch calls.
+// The active transport, its flows and the SOCKS endpoint stay as they are. Any
+// other change, except the preferred endpoint, is rejected without effect.
+func (e *Engine) Refresh(configJSON string) error {
+	next, err := parseConfig(configJSON)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return net.ErrClosed
+	}
+	if !reflect.DeepEqual(withoutRefreshable(e.config), withoutRefreshable(next)) {
+		return errRefreshChanged
+	}
+	e.config = next
+	return nil
+}
+
+func withoutRefreshable(c mobileConfig) mobileConfig {
+	c.Profile.Password, c.PreferredEndpoint = "", ""
+	c.Endpoints = slices.Clone(c.Endpoints)
+	for i := range c.Endpoints {
+		c.Endpoints[i].Password = ""
+	}
+	return c
 }
 
 // Close stops listeners, accepted flows, DNS requests and the encrypted transport.

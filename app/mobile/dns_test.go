@@ -2531,19 +2531,31 @@ func TestEndpointRejectsTruncatedData(t *testing.T) {
 	}
 }
 
-type localHysteriaAuth struct{ peers chan net.Addr }
+type localHysteriaAuth struct {
+	peers  chan net.Addr
+	accept func(string) bool // Nil accepts only the legacy ticket.
+}
 
 func (a localHysteriaAuth) Authenticate(peer net.Addr, auth string, _ uint64) (bool, string) {
-	if auth == "legacy-ticket" {
+	ok := auth == "legacy-ticket"
+	if a.accept != nil {
+		ok = a.accept(auth)
+	}
+	if ok {
 		select {
 		case a.peers <- peer:
 		default:
 		}
 	}
-	return auth == "legacy-ticket", "local-test"
+	return ok, "local-test"
 }
 
 func localHysteriaEndpoint(t *testing.T) (endpoint, <-chan net.Addr) {
+	t.Helper()
+	return localHysteriaServer(t, nil)
+}
+
+func localHysteriaServer(t *testing.T, accept func(string) bool) (endpoint, <-chan net.Addr) {
 	t.Helper()
 	certificate := httptest.NewTLSServer(http.NotFoundHandler())
 	t.Cleanup(certificate.Close)
@@ -2552,7 +2564,7 @@ func localHysteriaEndpoint(t *testing.T) (endpoint, <-chan net.Addr) {
 		t.Fatal(err)
 	}
 	peers := make(chan net.Addr, 1)
-	server, err := hyserver.NewServer(&hyserver.Config{Conn: packet, TLSConfig: hyserver.TLSConfig{Certificates: certificate.TLS.Certificates}, Authenticator: localHysteriaAuth{peers: peers}, QUICConfig: hyserver.QUICConfig{DisableGSO: true}})
+	server, err := hyserver.NewServer(&hyserver.Config{Conn: packet, TLSConfig: hyserver.TLSConfig{Certificates: certificate.TLS.Certificates}, Authenticator: localHysteriaAuth{peers: peers, accept: accept}, QUICConfig: hyserver.QUICConfig{DisableGSO: true}})
 	if err != nil {
 		_ = packet.Close()
 		t.Fatal(err)
@@ -2842,6 +2854,167 @@ func TestTrySwitch(t *testing.T) {
 			t.Fatal("The failed probe changed the active transport")
 		}
 		exchange(t, conn)
+	})
+	withTicket := func(ticket string, points ...endpoint) []endpoint {
+		for i := range points {
+			points[i].Password = ticket
+		}
+		return points
+	}
+	t.Run("refresh", func(t *testing.T) {
+		localTransportProbe(t)
+		var ticket atomic.Value
+		var rejected atomic.Int64
+		ticket.Store("ticket-old")
+		first, _ := localHysteriaServer(t, func(auth string) bool {
+			if auth != ticket.Load().(string) {
+				rejected.Add(1)
+				return false
+			}
+			return true
+		})
+		first.ID = "first"
+		second := first
+		second.ID = "second"
+		e := startTransportEngine(t, withTicket("ticket-old", first, second), "")
+		conn := openEcho(t, e)
+		exchange(t, conn)
+		// The node issues only the new ticket but keeps the established session.
+		ticket.Store("ticket-new")
+		if e.TrySwitch(second.ID) || rejected.Load() == 0 {
+			t.Fatal("TrySwitch did not fail authentication with the expired ticket")
+		}
+		moved := second
+		moved.Port++
+		rules, err := json.Marshal(mobileConfig{Endpoints: withTicket("ticket-new", first, second), Routing: "ALL", Rules: &routingRules{ProxySuffix: []string{}, DirectSuffix: []string{"example.com"}, DirectDomain: []string{}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, config := range []string{"{", transportConfigJSON(t, withTicket("ticket-new", first, moved), ""), transportConfigJSON(t, withTicket("ticket-new", second, first), ""), string(rules)} {
+			if err := e.Refresh(config); err == nil || strings.Contains(err.Error(), "ticket-") {
+				t.Fatalf("Refresh with a changed configuration = %v", err)
+			}
+		}
+		if e.snapshot().Endpoints[1].Password != "ticket-old" {
+			t.Fatal("A rejected Refresh changed the configuration")
+		}
+		hy, generation, port, hev, resolver := e.hy, e.generation.Load(), e.SocksPort(), e.HEVConfig(), e.dns
+		proxyTx, proxyRx, tx, rx := e.ProxyTxBytes(), e.ProxyRxBytes(), e.TxBytes(), e.RxBytes()
+		if err := e.Refresh(transportConfigJSON(t, withTicket("ticket-new", first, second), second.ID)); err != nil {
+			t.Fatal(err)
+		}
+		if e.hy != hy || e.ActiveEndpoint() != first.ID || e.generation.Load() != generation || e.SocksPort() != port || e.HEVConfig() != hev || e.dns != resolver ||
+			e.ProxyTxBytes() != proxyTx || e.ProxyRxBytes() != proxyRx || e.TxBytes() < tx || e.RxBytes() < rx {
+			t.Fatal("Refresh changed the active transport, SOCKS endpoint, DNS resolver or counters")
+		}
+		exchange(t, conn)
+		if !e.TrySwitch(second.ID) || e.ActiveEndpoint() != second.ID {
+			t.Fatal("TrySwitch did not authenticate with the refreshed ticket")
+		}
+		ticket.Store("ticket-next")
+		if err := e.Reconnect(); err == nil {
+			t.Fatal("Reconnect authenticated with the expired ticket")
+		}
+		var attempts []endpointAttempt
+		if err := json.Unmarshal([]byte(LastStartReport()), &attempts); err != nil || len(attempts) != 2 || attempts[0].Stage != "auth" || attempts[1].Stage != "auth" {
+			t.Fatalf("Expired-ticket Reconnect report = %s", LastStartReport())
+		}
+		next := transportConfigJSON(t, withTicket("ticket-next", first, second), "")
+		if err := e.Refresh(next); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != second.ID {
+			t.Fatalf("Reconnect after Refresh = %v, endpoint %q", err, e.ActiveEndpoint())
+		}
+		exchange(t, openEcho(t, e))
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Refresh(next); err == nil {
+			t.Fatal("Refresh accepted a closed engine")
+		}
+	})
+	t.Run("refresh-concurrent", func(t *testing.T) {
+		localTransportProbe(t)
+		// Each endpoint has its own server and a per-version ticket, so an attempt
+		// with another endpoint's or an unissued ticket fails here.
+		var issued, mixed atomic.Int64
+		issued.Store(1)
+		server := func(id string) endpoint {
+			point, _ := localHysteriaServer(t, func(auth string) bool {
+				var version int64
+				if _, err := fmt.Sscanf(auth, id+"-%d", &version); err != nil || auth != fmt.Sprintf("%s-%d", id, version) || version < 1 || version > issued.Load() {
+					mixed.Add(1)
+					return false
+				}
+				return true
+			})
+			point.ID = id
+			return point
+		}
+		a, b := server("a"), server("b")
+		configJSON := func(version int64) string {
+			a, b := a, b
+			a.Password, b.Password = fmt.Sprintf("a-%d", version), fmt.Sprintf("b-%d", version)
+			return transportConfigJSON(t, []endpoint{a, b}, []string{"a", "b"}[version%2])
+		}
+		e, err := Start(configJSON(1), &transportTestPlatform{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = e.Close() })
+		var closing atomic.Bool
+		var refreshes, cycles atomic.Int64
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for version := int64(2); ; version++ {
+				issued.Store(version)
+				if err := e.Refresh(configJSON(version)); err != nil {
+					if !closing.Load() {
+						t.Errorf("Refresh before Close = %v", err)
+					}
+					return
+				}
+				refreshes.Add(1)
+			}
+		}()
+		// Reconnect and TrySwitch alternate so each must succeed; concurrent
+		// Reconnects would otherwise cancel TrySwitch by changing the generation.
+		go func() {
+			defer wg.Done()
+			for !closing.Load() {
+				err := e.Reconnect()
+				id := "a"
+				if e.ActiveEndpoint() == id {
+					id = "b"
+				}
+				switched := err == nil && e.TrySwitch(id)
+				if closing.Load() {
+					return
+				}
+				if !switched {
+					t.Errorf("Before Close: Reconnect = %v, TrySwitch(%q) = false", err, id)
+					return
+				}
+				cycles.Add(1)
+			}
+		}()
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline) && (refreshes.Load() < 10 || cycles.Load() < 5); {
+			time.Sleep(10 * time.Millisecond)
+		}
+		closing.Store(true)
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		wg.Wait()
+		if refreshes.Load() < 10 || cycles.Load() < 5 || mixed.Load() != 0 {
+			t.Fatalf("%d refreshes, %d Reconnect and TrySwitch cycles, %d attempts with mixed or unissued tickets", refreshes.Load(), cycles.Load(), mixed.Load())
+		}
+		if e.ActiveEndpoint() != "" || e.Refresh(configJSON(issued.Load())) == nil {
+			t.Fatal("The closed engine kept a transport or accepted Refresh")
+		}
 	})
 }
 

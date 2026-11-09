@@ -84,7 +84,7 @@ func (d *dnsResolver) exchange(ctx context.Context, query []byte) ([]byte, error
 		return nil, err
 	}
 	question := request.Question[0]
-	if d.engine.config.Rules.hasDirect() && d.engine.config.Rules.direct(question.Name) {
+	if rules := d.engine.rules(); rules.hasDirect() && rules.direct(question.Name) {
 		response := new(dns.Msg)
 		response.SetReply(request)
 		response.RecursionAvailable = true
