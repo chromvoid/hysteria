@@ -166,8 +166,11 @@ func Start(configJSON string, platform Platform) (*Engine, error) {
 // Tests replace the URL with a loopback server to avoid external network access.
 var healthProbeURL = "https://speed.cloudflare.com/__down?bytes=65536"
 
+// Each endpoint gets up to endpointTimeout. A connect call's budget covers
+// every endpoint it tries, at least connectTimeout and at most maxConnectTimeout.
 var endpointTimeout = 10 * time.Second
 var connectTimeout = 30 * time.Second
+var maxConnectTimeout = 60 * time.Second
 var wallNow = func() time.Time { return time.Now().Round(0) }
 
 var errEndpointAuth = errors.New("Could not authenticate the VPN transport. Check the profile and network.")
@@ -220,10 +223,6 @@ func connectContextError(ctx context.Context) error {
 }
 
 func (e *Engine) connect(first string) error {
-	deadline := wallNow().Add(connectTimeout)
-	ctx, cancel := context.WithTimeout(e.ctx, connectTimeout)
-	defer cancel()
-	ctx = context.WithValue(ctx, connectDeadlineKey{}, deadline)
 	config := e.snapshot()
 	points := make([]endpoint, 0, len(config.Endpoints))
 	for _, p := range config.Endpoints {
@@ -247,6 +246,11 @@ func (e *Engine) connect(first string) error {
 			endpoints = append(endpoints, p)
 		}
 	}
+	budget := min(max(time.Duration(len(endpoints))*endpointTimeout, connectTimeout), maxConnectTimeout)
+	deadline := wallNow().Add(budget)
+	ctx, cancel := context.WithTimeout(e.ctx, budget)
+	defer cancel()
+	ctx = context.WithValue(ctx, connectDeadlineKey{}, deadline)
 	report := make([]endpointAttempt, 0, len(endpoints))
 	defer func() {
 		encoded, _ := json.Marshal(report)
@@ -260,6 +264,10 @@ func (e *Engine) connect(first string) error {
 			}
 			if i > 0 && allAuth {
 				return errEndpointAuth
+			}
+			// Clients fall back to their last path only on errEndpointCheck.
+			if i > 0 && errors.Is(err, context.DeadlineExceeded) {
+				return errEndpointCheck
 			}
 			return err
 		}

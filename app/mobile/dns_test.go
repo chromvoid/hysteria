@@ -2199,38 +2199,47 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 			t.Fatal("Canceled REALITY handshake left its TCP socket open")
 		}
 	})
-	t.Run("all-silent", func(t *testing.T) {
-		previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
-		endpointTimeout, connectTimeout = time.Second, 1500*time.Millisecond
-		t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
+	silentEngine := func(t *testing.T, count int) (*Engine, []endpoint, <-chan struct{}) {
+		t.Helper()
 		blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer blackhole.Close()
+		t.Cleanup(func() { _ = blackhole.Close() })
+		attempted := make(chan struct{}, 1)
 		go func() {
 			var packet [2048]byte
 			for {
 				if _, _, err := blackhole.ReadFrom(packet[:]); err != nil {
 					return
 				}
+				select {
+				case attempted <- struct{}{}:
+				default:
+				}
 			}
 		}()
-		points := make([]endpoint, 4)
+		points := make([]endpoint, count)
 		for i := range points {
 			points[i] = endpoint{ID: fmt.Sprintf("silent-%d", i), Kind: "hysteria2", Server: "127.0.0.1", Port: blackhole.LocalAddr().(*net.UDPAddr).Port, ServerName: "example.com", Password: "silent-ticket"}
 		}
+		e := newTestEngine(t, "ALL")
+		e.platform, e.config.Endpoints = &transportTestPlatform{}, points
+		return e, points, attempted
+	}
+	t.Run("all-silent", func(t *testing.T) {
+		previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
+		endpointTimeout, connectTimeout = 400*time.Millisecond, 1200*time.Millisecond
+		t.Cleanup(func() { endpointTimeout, connectTimeout = previousEndpointTimeout, previousConnectTimeout })
+		// Five attempts outlast the connectTimeout floor; relay endpoints at the tail still get theirs.
+		e, points, _ := silentEngine(t, 5)
 		started := time.Now()
-		e, err := Start(transportConfigJSON(t, points, ""), &transportTestPlatform{})
-		if e != nil {
-			_ = e.Close()
+		if err := e.connect(""); !errors.Is(err, errEndpointCheck) || time.Since(started) > 5*endpointTimeout+2*time.Second {
+			t.Fatalf("All-silent connect = %v after %s", err, time.Since(started))
 		}
-		if err == nil || err.Error() != "No VPN endpoint passed the data transfer check." || time.Since(started) > connectTimeout+2*time.Second {
-			t.Fatalf("All-silent Start = %v after %s", err, time.Since(started))
-		}
-		attempts := assertReport(t, points, []string{"handshake", "handshake", "deadline", "deadline"})
+		attempts := assertReport(t, points, []string{"handshake", "handshake", "handshake", "handshake", "handshake"})
 		for _, attempt := range attempts {
-			if attempt.MS > (endpointTimeout+time.Second).Milliseconds() || (attempt.Stage == "deadline" && attempt.MS != 0) {
+			if attempt.MS > (endpointTimeout + time.Second).Milliseconds() {
 				t.Fatalf("Endpoint exceeded its attempt limit: %+v", attempt)
 			}
 		}
@@ -2273,6 +2282,87 @@ func TestEndpointSelectionAndReconnect(t *testing.T) {
 		if attempts[0].MS < time.Minute.Milliseconds() || attempts[1].MS != 0 {
 			t.Fatalf("Wall-clock sleep was lost from the report: %+v", attempts)
 		}
+	})
+	fakeWall := func(t *testing.T) *atomic.Int64 {
+		var sleep atomic.Int64
+		previous := wallNow
+		wallNow = func() time.Time { return time.Now().Round(0).Add(time.Duration(sleep.Load())) }
+		t.Cleanup(func() { wallNow = previous })
+		return &sleep
+	}
+	t.Run("connect-ceiling", func(t *testing.T) {
+		point, _ := localHysteriaEndpoint(t)
+		sleep, step := fakeWall(t), endpointTimeout
+		// Each rejected probe stands for an endpoint that used its whole attempt.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sleep.Add(int64(step))
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		previousProbe := healthProbeURL
+		healthProbeURL = server.URL
+		t.Cleanup(func() { healthProbeURL = previousProbe })
+		points := make([]endpoint, 7)
+		for i := range points {
+			points[i] = point
+			points[i].ID = fmt.Sprintf("relay-%d", i)
+		}
+		e := newTestEngine(t, "ALL")
+		e.platform, e.config.Endpoints = &transportTestPlatform{}, points
+		if err := e.connect(""); !errors.Is(err, errEndpointCheck) {
+			t.Fatalf("Connect past the ceiling = %v", err)
+		}
+		assertReport(t, points, []string{"probe", "probe", "probe", "probe", "probe", "probe", "deadline"})
+	})
+	t.Run("auth-deadline", func(t *testing.T) {
+		sleep := fakeWall(t)
+		point, _ := localHysteriaServer(t, func(string) bool {
+			sleep.Add(int64(time.Hour))
+			return false
+		})
+		next := point
+		next.ID = "relay"
+		e := newTestEngine(t, "ALL")
+		e.platform, e.config.Endpoints = &transportTestPlatform{}, []endpoint{point, next}
+		if err := e.connect(""); !errors.Is(err, errEndpointAuth) {
+			t.Fatalf("All-auth connect past the deadline = %v", err)
+		}
+		assertReport(t, []endpoint{point, next}, []string{"auth", "deadline"})
+	})
+	t.Run("deadline-before-attempt", func(t *testing.T) {
+		sleep := fakeWall(t)
+		e, points, _ := silentEngine(t, 2)
+		previous := wallNow
+		// The device sleeps right after connect sets its deadline.
+		wallNow = func() time.Time {
+			now := previous()
+			sleep.Store(int64(time.Hour))
+			return now
+		}
+		if err := e.connect(""); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Connect after sleep = %v", err)
+		}
+		assertReport(t, points, []string{"deadline", "deadline"})
+	})
+	t.Run("close-during-connect", func(t *testing.T) {
+		e, points, attempted := silentEngine(t, 3)
+		result := make(chan error, 1)
+		go func() { result <- e.connect("") }()
+		select {
+		case <-attempted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("The first endpoint was not attempted")
+		}
+		_ = e.Close()
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Connect during Close = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not stop connect")
+		}
+		assertReport(t, points, []string{"handshake", "deadline", "deadline"})
 	})
 	t.Run("probe-read-cancellation", func(t *testing.T) {
 		previousEndpointTimeout, previousConnectTimeout := endpointTimeout, connectTimeout
