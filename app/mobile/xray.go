@@ -58,6 +58,10 @@ const xraySocketOwnerField protowire.Number = 50000
 
 var xrayDialerOnce sync.Once
 var xrayDialerError error
+
+// cdnPaddingHeader carries XHTTP padding on CDN endpoints; it must match the node.
+const cdnPaddingHeader = "X-Request-Id"
+
 var xrayOwnerCounter atomic.Uint64
 var xraySocketOwners sync.Map // uint64 -> *xrayTransport
 
@@ -116,6 +120,14 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 			Host: p.ServerName, Path: p.Path, Mode: "packet-up", UplinkHTTPMethod: p.UplinkMethod, UplinkDataPlacement: p.DataPlacement,
 			UplinkDataKey:      dataKey,
 			ScMaxEachPostBytes: &splithttp.RangeConfig{From: int32(p.MaxPostBytes), To: int32(p.MaxPostBytes)},
+			// The Timeweb CDN edge rejects Xray's default x_padding Referer query and runs
+			// of one repeated character, so padding is random base62 in its own header.
+			// The node's xhttp-cdn inbound uses the same settings (kaifaty/infra,
+			// vpn_node_cdn_padding_header).
+			XPaddingObfsMode:  true,
+			XPaddingPlacement: "header",
+			XPaddingHeader:    cdnPaddingHeader,
+			XPaddingMethod:    "tokenish",
 		})}}
 		account, err = cdnVLESSAccount(p)
 		if err != nil {

@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -1538,8 +1539,9 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 		stream.TransportSettings = []*internet.TransportConfig{{ProtocolName: "splithttp", Settings: serial.ToTypedMessage(&splithttp.Config{
 			Host: point.ServerName, Path: point.Path, Mode: point.Mode, UplinkHTTPMethod: point.UplinkMethod, UplinkDataPlacement: point.DataPlacement,
 			UplinkDataKey: dataKey,
-			// Match kaifaty/infra@d1a9a65: ansible/roles/vpn_node/templates/xray.json.j2.
+			// Match kaifaty/infra ansible/roles/vpn_node/templates/xray.json.j2.
 			ServerMaxHeaderBytes: 64 * 1024,
+			XPaddingObfsMode:     true, XPaddingPlacement: "header", XPaddingHeader: cdnPaddingHeader, XPaddingMethod: "tokenish",
 		})}}
 		stream.SecurityType, stream.SecuritySettings = security.Type, []*serial.TypedMessage{security}
 		roots := x509.NewCertPool()
@@ -1554,6 +1556,12 @@ func localXrayServer(t *testing.T, kind, flow string) (endpoint, *xcore.Instance
 			if point.DataPlacement == "cookie" {
 				cookie, err := r.Cookie("x_data_0")
 				payloadPresent = err == nil && cookie.Value != ""
+			}
+			if reason := timewebEdgeRejection(r); reason != "" {
+				t.Errorf("The Timeweb CDN edge would reject this request: %s", reason)
+				w.Header().Set("X-Reason-Code", "7")
+				http.Error(w, "Forbidden.", http.StatusForbidden)
+				return
 			}
 			if r.TLS == nil || r.TLS.ServerName != point.ServerName || r.Host != point.ServerName || r.Method != http.MethodGet ||
 				(uplink && (!payloadPresent || r.ContentLength != 0)) {
@@ -3463,8 +3471,8 @@ func TestNoCopyleftDependencies(t *testing.T) {
 		seen[m.Path] = true
 		check(m.Path)
 		if m.Path == "github.com/xtls/xray-core" && (m.Version != "v1.260327.0" || m.Replace == nil ||
-			m.Replace.Path != "github.com/chromvoid/Xray-core" || m.Replace.Version != "v0.0.0-20261031102336-cad524c1b2de") {
-			t.Fatal("Xray must use the reviewed ChromVoid fork at cad524c1b2de40d5b22371e4872609c2e361e371")
+			m.Replace.Path != "github.com/chromvoid/Xray-core" || m.Replace.Version != "v0.0.0-20261114193945-c8acf0a4a9ab") {
+			t.Fatal("Xray must use the reviewed ChromVoid fork at c8acf0a4a9ab4a26f6108a1ade355d8ffda513de")
 		}
 		if m.Replace != nil {
 			if m.Replace.Version != "" {
@@ -3476,5 +3484,94 @@ func TestNoCopyleftDependencies(t *testing.T) {
 	}
 	if !seen["github.com/xtls/xray-core"] {
 		t.Fatal("The dependency check did not include the Xray transport")
+	}
+}
+
+var (
+	edgeLowercaseUUID = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	edgeLongRun       = regexp.MustCompile(`[A-Za-z0-9]{16}`)
+)
+
+// timewebEdgeRejection mirrors the requests the Timeweb CDN edge answered itself
+// with 403 and X-Reason-Code: 7 on 2026-11-14 (wayveil
+// docs/deployment-and-first-node.md): a lowercase UUID or x_padding anywhere, a
+// run of one character in a header, and a long letter or digit run in an
+// extensionless path or its query.
+func timewebEdgeRejection(r *http.Request) string {
+	values := []string{r.URL.Path, r.URL.RawQuery}
+	for name, headerValues := range r.Header {
+		values = append(values, name)
+		values = append(values, headerValues...)
+		for _, value := range headerValues {
+			// A long run of one character passed in a path with an extension.
+			if hasRepeatedRun(value, 16) {
+				return "repeated character run"
+			}
+		}
+	}
+	for _, value := range values {
+		switch {
+		case edgeLowercaseUUID.MatchString(value):
+			return "lowercase UUID"
+		case strings.Contains(strings.ToLower(value), "x_padding"):
+			return "x_padding"
+		}
+	}
+	last := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+	if !strings.Contains(last, ".") && (edgeLongRun.MatchString(r.URL.Path) || edgeLongRun.MatchString(r.URL.RawQuery)) {
+		return "long path or query run"
+	}
+	return ""
+}
+
+func hasRepeatedRun(value string, length int) bool {
+	run := 0
+	for i := range value {
+		if i > 0 && value[i] == value[i-1] {
+			run++
+		} else {
+			run = 1
+		}
+		if run >= length {
+			return true
+		}
+	}
+	return false
+}
+
+func TestTimewebEdgeRejectionMatchesProbes(t *testing.T) {
+	request := func(target string, header ...string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "https://cdn.example.test"+target, nil)
+		for i := 0; i+1 < len(header); i += 2 {
+			r.Header.Set(header[i], header[i+1])
+		}
+		return r
+	}
+	rejected := []*http.Request{
+		request("/a/e397086d-489f-4b65-bed2-04b572015980"),
+		request("/a/", "X-Session", "e397086d-489f-4b65-bed2-04b572015980"),
+		request("/aaaaaaaaaaaaaaaa"),
+		request("/2e97923a39b6551d64a40c62/x"),
+		request("/a?x=aaaaaaaaaaaaaaaaaaaaaaaa"),
+		request("/a/", "Referer", "https://cdn.example.test/a/?x_padding=XXXXXXXX"),
+		request("/a/", "X-Foo", strings.Repeat("X", 500)),
+	}
+	for _, r := range rejected {
+		if timewebEdgeRejection(r) == "" {
+			t.Errorf("%s %v passed the emulated edge", r.URL, r.Header)
+		}
+	}
+	passed := []*http.Request{
+		request("/aaaaaaaaaaaaaaa"),
+		request("/aaaaaaaaaaaaaaaa.js"),
+		request("/aaaa-aaaa-aaaa-aaaa"),
+		request("/02dc62df/b7dc2920/fa3e664d/E397086D-489F-4B65-BED2-04B572015980/17"),
+		request("/a/", "X-Session", "E397086D-489F-4B65-BED2-04B572015980"),
+		request("/a/", "X-Request-Id", "k3J9xQ2mZ7aBc4dXZq81Lm"),
+	}
+	for _, r := range passed {
+		if reason := timewebEdgeRejection(r); reason != "" {
+			t.Errorf("%s %v was rejected: %s", r.URL, r.Header, reason)
+		}
 	}
 }
