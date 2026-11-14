@@ -3551,7 +3551,7 @@ func TestTimewebEdgeRejectionMatchesProbes(t *testing.T) {
 		request("/a/e397086d-489f-4b65-bed2-04b572015980"),
 		request("/a/", "X-Session", "e397086d-489f-4b65-bed2-04b572015980"),
 		request("/aaaaaaaaaaaaaaaa"),
-		request("/2e97923a39b6551d64a40c62/x"),
+		request("/0123456789abcdef01234567/x"),
 		request("/a?x=aaaaaaaaaaaaaaaaaaaaaaaa"),
 		request("/a/", "Referer", "https://cdn.example.test/a/?x_padding=XXXXXXXX"),
 		request("/a/", "X-Foo", strings.Repeat("X", 500)),
@@ -3565,7 +3565,7 @@ func TestTimewebEdgeRejectionMatchesProbes(t *testing.T) {
 		request("/aaaaaaaaaaaaaaa"),
 		request("/aaaaaaaaaaaaaaaa.js"),
 		request("/aaaa-aaaa-aaaa-aaaa"),
-		request("/02dc62df/b7dc2920/fa3e664d/E397086D-489F-4B65-BED2-04B572015980/17"),
+		request("/1a2b3c4d/5e6f7a8b/9c0d1e2f/E397086D-489F-4B65-BED2-04B572015980/17"),
 		request("/a/", "X-Session", "E397086D-489F-4B65-BED2-04B572015980"),
 		request("/a/", "X-Request-Id", "k3J9xQ2mZ7aBc4dXZq81Lm"),
 	}
