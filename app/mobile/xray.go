@@ -17,9 +17,11 @@ import (
 
 	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/xtls/xray-core/app/dispatcher"
+	xlog "github.com/xtls/xray-core/app/log"
 	"github.com/xtls/xray-core/app/proxyman"
 	_ "github.com/xtls/xray-core/app/proxyman/outbound"
 	"github.com/xtls/xray-core/common/buf"
+	xseverity "github.com/xtls/xray-core/common/log"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -61,6 +63,12 @@ var xrayDialerError error
 
 // cdnPaddingHeader carries XHTTP padding on CDN endpoints; it must match the node.
 const cdnPaddingHeader = "X-Request-Id"
+
+// xrayLogConfig keeps Xray's own log to warnings and turns its access log off. Without it Xray prints a line
+// for every connection and packet, with the destination, to the process output: the system journal on a gateway.
+func xrayLogConfig() *xlog.Config {
+	return &xlog.Config{ErrorLogType: xlog.LogType_Console, ErrorLogLevel: xseverity.Severity_Warning, AccessLogType: xlog.LogType_None}
+}
 
 var xrayOwnerCounter atomic.Uint64
 var xraySocketOwners sync.Map // uint64 -> *xrayTransport
@@ -160,7 +168,7 @@ func (e *Engine) newXrayTransport(ctx context.Context, p endpoint) (vpnTransport
 		tcpConcurrency = 8
 	}
 	config := &core.Config{
-		App: []*serial.TypedMessage{serial.ToTypedMessage(&dispatcher.Config{}), serial.ToTypedMessage(&proxyman.OutboundConfig{})},
+		App: []*serial.TypedMessage{serial.ToTypedMessage(xrayLogConfig()), serial.ToTypedMessage(&dispatcher.Config{}), serial.ToTypedMessage(&proxyman.OutboundConfig{})},
 		Outbound: []*core.OutboundHandlerConfig{{
 			Tag: "vless", SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
 				StreamSettings: stream,
