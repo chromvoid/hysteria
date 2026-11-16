@@ -843,6 +843,9 @@ func (e *Engine) closeFlows() {
 	}
 }
 
+// udpSocketBuffer is the size quic-go asks for on a socket of its own.
+const udpSocketBuffer = 7 << 20
+
 type packetFactory struct {
 	engine       *Engine
 	obfsPassword string
@@ -860,6 +863,13 @@ func (f *packetFactory) New(addr net.Addr) (net.PacketConn, error) {
 	conn, err := config.ListenPacket(e.ctx, network, address)
 	if err != nil {
 		return nil, errors.New("Could not open the VPN transport socket.")
+	}
+	// quic-go enlarges the buffers only of a socket it can see, and ours is wrapped. With the
+	// default 208 KB a Linux gateway dropped thousands of packets in one fast download.
+	// The system caps the size, so a refusal changes nothing.
+	if udp, ok := conn.(*net.UDPConn); ok {
+		_ = udp.SetReadBuffer(udpSocketBuffer)
+		_ = udp.SetWriteBuffer(udpSocketBuffer)
 	}
 	tracked := &trackedPacket{PacketConn: conn, engine: e}
 	if !f.untracked && !e.addFlow(tracked, gen) {
