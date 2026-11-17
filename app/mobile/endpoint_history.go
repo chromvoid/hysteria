@@ -247,23 +247,7 @@ func (e *Engine) TryBetter() string {
 	if closed || active == "" || !config.AdaptiveEndpoints {
 		return ""
 	}
-	points := usablePoints(config)
-	index := pointIndex(points, active)
-	if index < 0 {
-		return ""
-	}
-	fromFallback := isFallback(config, points[index])
-	now := wallNow()
-	var candidates []endpoint
-	for i, p := range points {
-		// Ahead of an ordinary endpoint are the ordinary ones configured before it.
-		if p.ID == active || isFallback(config, p) || (!fromFallback && i > index) {
-			continue
-		}
-		if _, bad := e.history.unhealthySince(p.ID, now); !bad {
-			candidates = append(candidates, p)
-		}
-	}
+	candidates := e.betterCandidates(config, active, wallNow())
 	if len(candidates) == 0 {
 		return ""
 	}
@@ -286,6 +270,28 @@ func (e *Engine) TryBetter() string {
 		return ""
 	}
 	return ""
+}
+
+// betterCandidates are the healthy endpoints configured ahead of the active
+// one, in the configured order. Ahead of an ordinary endpoint are the ordinary
+// ones before it; ahead of a CDN fallback is every ordinary endpoint.
+func (e *Engine) betterCandidates(config mobileConfig, active string, now time.Time) []endpoint {
+	points := usablePoints(config)
+	index := pointIndex(points, active)
+	if index < 0 {
+		return nil
+	}
+	fromFallback := isFallback(config, points[index])
+	var candidates []endpoint
+	for i, p := range points {
+		if p.ID == active || isFallback(config, p) || (!fromFallback && i > index) {
+			continue
+		}
+		if _, bad := e.history.unhealthySince(p.ID, now); !bad {
+			candidates = append(candidates, p)
+		}
+	}
+	return candidates
 }
 
 // probeCandidate brings an endpoint up beside the active transport and runs
