@@ -244,10 +244,8 @@ func (e *Engine) connect(first string) error {
 	for i, p := range endpoints {
 		if err := connectContextError(ctx); err != nil {
 			for _, remaining := range endpoints[i:] {
+				// An endpoint the deadline kept from being tried has not failed.
 				report = append(report, endpointAttempt{ID: remaining.ID, Kind: remaining.Kind, Stage: "deadline"})
-				if config.AdaptiveEndpoints {
-					e.history.startFailed(remaining.ID, wallNow())
-				}
 			}
 			if i > 0 && allAuth {
 				return errEndpointAuth
