@@ -50,6 +50,7 @@ type mobileConfig struct {
 	Endpoints         []endpoint    `json:"endpoints"`
 	PreferredEndpoint string        `json:"preferred_endpoint"`
 	WhitelistMode     bool          `json:"whitelist_mode"`
+	AdaptiveEndpoints bool          `json:"adaptive_endpoints"` // See attemptOrder.
 	Routing           string        `json:"routing"`
 	Rules             *routingRules `json:"rules"`
 }
@@ -111,13 +112,16 @@ type Engine struct {
 	listener net.Listener
 	dns      *dnsResolver
 
+	// Lock order: switching (a try-only flag, never waited on) → reconnectMu → mu → flowMu; history.mu comes last and nothing is locked under it.
 	mu          sync.RWMutex
 	hy          vpnTransport
 	activeID    string
 	lastGoodID  string
+	activeSince time.Time // Wall time activeID became active; zero when the run is not judged.
 	closed      bool
 	reconnectMu sync.Mutex
 	switching   atomic.Bool
+	history     endpointHistory
 	flowMu      sync.Mutex
 	flows       map[io.Closer]struct{}
 	generation  atomic.Uint64
@@ -224,28 +228,7 @@ func connectContextError(ctx context.Context) error {
 
 func (e *Engine) connect(first string) error {
 	config := e.snapshot()
-	points := make([]endpoint, 0, len(config.Endpoints))
-	for _, p := range config.Endpoints {
-		if (p.Kind == "vless_xhttp_cdn") == config.WhitelistMode {
-			points = append(points, p)
-		}
-	}
-	endpoints := make([]endpoint, 0, len(config.Endpoints))
-	for _, p := range points {
-		if p.ID == first {
-			endpoints = append(endpoints, p)
-		}
-	}
-	for _, p := range points {
-		if p.ID == config.PreferredEndpoint && p.ID != first {
-			endpoints = append(endpoints, p)
-		}
-	}
-	for _, p := range points {
-		if p.ID != first && p.ID != config.PreferredEndpoint {
-			endpoints = append(endpoints, p)
-		}
-	}
+	endpoints := e.attemptOrder(config, first)
 	budget := min(max(time.Duration(len(endpoints))*endpointTimeout, connectTimeout), maxConnectTimeout)
 	deadline := wallNow().Add(budget)
 	ctx, cancel := context.WithTimeout(e.ctx, budget)
@@ -260,6 +243,7 @@ func (e *Engine) connect(first string) error {
 	for i, p := range endpoints {
 		if err := connectContextError(ctx); err != nil {
 			for _, remaining := range endpoints[i:] {
+				// An endpoint the deadline kept from being tried has not failed.
 				report = append(report, endpointAttempt{ID: remaining.ID, Kind: remaining.Kind, Stage: "deadline"})
 			}
 			if i > 0 && allAuth {
@@ -304,7 +288,16 @@ func (e *Engine) connect(first string) error {
 		report = append(report, endpointAttempt{ID: p.ID, Kind: p.Kind, Stage: stage, MS: max(0, wallNow().Sub(started).Milliseconds())})
 		allAuth = allAuth && stage == "auth"
 		if err != nil {
+			// A start that Close cut short says nothing about the endpoint.
+			if config.AdaptiveEndpoints && e.ctx.Err() == nil {
+				e.history.startFailed(p.ID, wallNow())
+			}
 			continue
+		}
+		// Without adaptive endpoints the clock is read exactly as before.
+		var since time.Time
+		if config.AdaptiveEndpoints {
+			since = wallNow()
 		}
 		e.mu.Lock()
 		if e.closed || e.ctx.Err() != nil {
@@ -312,8 +305,11 @@ func (e *Engine) connect(first string) error {
 			_ = transport.Close()
 			return net.ErrClosed
 		}
-		e.hy, e.activeID, e.lastGoodID = transport, p.ID, p.ID
+		e.hy, e.activeID, e.lastGoodID, e.activeSince = transport, p.ID, p.ID, since
 		e.mu.Unlock()
+		if config.AdaptiveEndpoints {
+			e.history.started(p.ID)
+		}
 		return nil
 	}
 	if len(report) > 0 && allAuth {
@@ -498,10 +494,14 @@ func (e *Engine) Reconnect() error {
 	}
 	hy := e.hy
 	first := e.lastGoodID
+	active, since, adaptive := e.activeID, e.activeSince, e.config.AdaptiveEndpoints
 	e.hy = nil
 	e.activeID = ""
 	e.generation.Add(1)
 	e.mu.Unlock()
+	if adaptive {
+		e.history.ended(active, since, wallNow(), true)
+	}
 	e.closeFlows()
 	if hy != nil {
 		_ = hy.Close()
@@ -545,17 +545,30 @@ func (e *Engine) TrySwitch(id string) bool {
 		if transport != nil {
 			_ = transport.Close()
 		}
+		if config.AdaptiveEndpoints && e.ctx.Err() == nil {
+			e.history.startFailed(id, wallNow())
+		}
 		return false
 	}
+	return e.promote(transport, id, gen, config.AdaptiveEndpoints)
+}
+
+// promote replaces the active transport with a probed one unless Close or
+// Reconnect has started a new generation since gen was read.
+func (e *Engine) promote(transport vpnTransport, id string, gen uint64, adaptive bool) bool {
 	e.reconnectMu.Lock()
 	defer e.reconnectMu.Unlock()
+	var since time.Time
+	if adaptive {
+		since = wallNow()
+	}
 	e.mu.Lock()
 	if e.closed || e.generation.Load() != gen {
 		e.mu.Unlock()
 		_ = transport.Close()
 		return false
 	}
-	old := e.hy
+	old, oldID, oldSince := e.hy, e.activeID, e.activeSince
 	// Snapshot before publishing the new generation so new flows survive the swap.
 	e.flowMu.Lock()
 	flows := make([]io.Closer, 0, len(e.flows))
@@ -563,9 +576,14 @@ func (e *Engine) TrySwitch(id string) bool {
 		flows = append(flows, flow)
 	}
 	e.generation.Add(1)
-	e.hy, e.activeID, e.lastGoodID = transport, id, id
+	e.hy, e.activeID, e.lastGoodID, e.activeSince = transport, id, id, since
 	e.flowMu.Unlock()
 	e.mu.Unlock()
+	if adaptive {
+		// Leaving an endpoint on purpose is not a drop, but a long run still clears its penalties.
+		e.history.ended(oldID, oldSince, since, false)
+		e.history.started(id)
+	}
 	for _, flow := range flows {
 		_ = flow.Close()
 	}
