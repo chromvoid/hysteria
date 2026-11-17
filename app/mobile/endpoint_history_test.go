@@ -47,7 +47,7 @@ func TestAdaptiveAttemptOrder(t *testing.T) {
 			t.Fatalf("Order without adaptive endpoints = %q", got)
 		}
 		e.activeID = "relay"
-		if got := e.TryBetter(); got != "" {
+		if got := e.TryBetter(""); got != "" {
 			t.Fatalf("TryBetter without adaptive endpoints = %q", got)
 		}
 		whitelist := engine(false, true, "")
@@ -114,6 +114,13 @@ func TestAdaptiveAttemptOrder(t *testing.T) {
 		if entries := e.history.entries(now); len(entries) != 1 || entries[0].PenaltyUntil != now.Add(penaltyBase).Unix() {
 			t.Fatalf("First strike after a reset = %+v", entries)
 		}
+		// A drop long after the last penalty ended starts the count again.
+		clock.Add(int64(penaltyBase + penaltyMax + time.Second))
+		now = wallNow()
+		e.history.ended("relay", now.Add(-time.Minute), now, true)
+		if entries := e.history.entries(now); len(entries) != 1 || entries[0].Strikes != 1 {
+			t.Fatalf("Strike after a long quiet time = %+v", entries)
+		}
 	})
 	t.Run("start-failure", func(t *testing.T) {
 		clock := historyClock(t)
@@ -149,7 +156,7 @@ func TestAdaptiveAttemptOrder(t *testing.T) {
 	})
 	t.Run("better-candidates", func(t *testing.T) {
 		e := engine(true, false, "")
-		better := func(active string) string { return endpointIDs(e.betterCandidates(e.config, active, wallNow())) }
+		better := func(active string) string { return endpointIDs(e.betterCandidates(e.config, active, "", wallNow())) }
 		for active, want := range map[string]string{"udp": "", "reality": "udp", "relay": "udp reality", "cdn": "udp reality relay", "cdn2": "udp reality relay", "unknown": ""} {
 			if got := better(active); got != want {
 				t.Fatalf("Better than %q = %q, want %q", active, got, want)
@@ -160,8 +167,12 @@ func TestAdaptiveAttemptOrder(t *testing.T) {
 		if got := better("cdn"); got != "relay" {
 			t.Fatalf("Better than cdn with unhealthy endpoints = %q", got)
 		}
+		e.history.reset()
+		if got := endpointIDs(e.betterCandidates(e.config, "cdn", "hysteria2", wallNow())); got != "reality relay" {
+			t.Fatalf("Better than cdn without Hysteria2 = %q", got)
+		}
 		whitelist := engine(true, true, "")
-		if got := endpointIDs(whitelist.betterCandidates(whitelist.config, "cdn2", wallNow())); got != "cdn" {
+		if got := endpointIDs(whitelist.betterCandidates(whitelist.config, "cdn2", "", wallNow())); got != "cdn" {
 			t.Fatalf("Better than cdn2 in whitelist mode = %q", got)
 		}
 	})
@@ -209,7 +220,7 @@ func TestAdaptiveReconnectAndTryBetter(t *testing.T) {
 	if err := e.connect(""); err != nil || e.ActiveEndpoint() != "a" {
 		t.Fatalf("Connect = %q, %v", e.ActiveEndpoint(), err)
 	}
-	if got := e.TryBetter(); got != "" {
+	if got := e.TryBetter(""); got != "" {
 		t.Fatalf("TryBetter on the first endpoint = %q", got)
 	}
 
@@ -224,13 +235,13 @@ func TestAdaptiveReconnectAndTryBetter(t *testing.T) {
 	if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != "b" {
 		t.Fatalf("Reconnect after a short run = %q, %v", e.ActiveEndpoint(), err)
 	}
-	if got := e.TryBetter(); got != "" || e.ActiveEndpoint() != "b" {
+	if got := e.TryBetter(""); got != "" || e.ActiveEndpoint() != "b" {
 		t.Fatalf("TryBetter under a penalty = %q, active %q", got, e.ActiveEndpoint())
 	}
 
 	// A second short run doubles the penalty.
 	clock.Add(int64(penaltyBase))
-	if got := e.TryBetter(); got != "a" || e.ActiveEndpoint() != "a" {
+	if got := e.TryBetter(""); got != "a" || e.ActiveEndpoint() != "a" {
 		t.Fatalf("TryBetter after the penalty = %q, active %q", got, e.ActiveEndpoint())
 	}
 	clock.Add(int64(time.Minute))
@@ -245,14 +256,14 @@ func TestAdaptiveReconnectAndTryBetter(t *testing.T) {
 	// A failed probe keeps the active endpoint and is remembered.
 	clock.Add(int64(2 * penaltyBase))
 	down[0].Store(true)
-	if got := e.TryBetter(); got != "" || e.ActiveEndpoint() != "b" {
+	if got := e.TryBetter(""); got != "" || e.ActiveEndpoint() != "b" {
 		t.Fatalf("TryBetter with a failing endpoint = %q, active %q", got, e.ActiveEndpoint())
 	}
 	if err := json.Unmarshal([]byte(e.EndpointHistory()), &entries); err != nil || len(entries) != 1 || !near(entries[0].StartFailedAt, wallNow()) {
 		t.Fatalf("History after a failed probe = %s, %v", e.EndpointHistory(), err)
 	}
 	down[0].Store(false)
-	if got := e.TryBetter(); got != "" {
+	if got := e.TryBetter(""); got != "" {
 		t.Fatalf("TryBetter within the failed start's memory = %q", got)
 	}
 
@@ -288,7 +299,7 @@ func TestAdaptiveEndpointsConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, work := range []func(){
 		func() { _ = e.Reconnect() },
-		func() { _ = e.TryBetter() },
+		func() { _ = e.TryBetter("") },
 		func() { _ = e.TrySwitch("a") },
 		func() { _ = e.TrySwitch("b") },
 		func() { _ = e.EndpointHistory(); e.ResetEndpointHistory() },
@@ -307,7 +318,7 @@ func TestAdaptiveEndpointsConcurrency(t *testing.T) {
 		_ = e.Close()
 	}()
 	wg.Wait()
-	if got := e.TryBetter(); got != "" {
+	if got := e.TryBetter(""); got != "" {
 		t.Fatalf("TryBetter after Close = %q", got)
 	}
 }

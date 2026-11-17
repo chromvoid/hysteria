@@ -84,6 +84,10 @@ func (h *endpointHistory) ended(id string, since, now time.Time, dropped bool) {
 		return
 	}
 	r := h.record(id)
+	// Strikes count drops in a row: one long after the last penalty starts over.
+	if r.strikes > 0 && now.Sub(r.penaltyUntil) > penaltyMax {
+		r.strikes = 0
+	}
 	r.strikes++
 	penalty := penaltyMax
 	// 6 h is under 10 min << 6, so larger shifts never need computing.
@@ -234,9 +238,11 @@ func pointIndex(points []endpoint, id string) int {
 // TryBetter moves a live connection to a healthy endpoint that is configured
 // ahead of the active one, without interrupting traffic: the old transport
 // carries it until the new one passes the probe. From a CDN fallback every
-// ordinary endpoint counts as ahead. It returns the ID of the endpoint it
-// moved to, or an empty string. It does nothing without adaptive endpoints.
-func (e *Engine) TryBetter() string {
+// ordinary endpoint counts as ahead. Endpoints of skipKind are left out: a
+// client that returns to Hysteria2 on its own schedule passes "hysteria2".
+// It returns the ID of the endpoint it moved to, or an empty string. It does
+// nothing without adaptive endpoints.
+func (e *Engine) TryBetter(skipKind string) string {
 	if !e.switching.CompareAndSwap(false, true) {
 		return ""
 	}
@@ -247,7 +253,7 @@ func (e *Engine) TryBetter() string {
 	if closed || active == "" || !config.AdaptiveEndpoints {
 		return ""
 	}
-	candidates := e.betterCandidates(config, active, wallNow())
+	candidates := e.betterCandidates(config, active, skipKind, wallNow())
 	if len(candidates) == 0 {
 		return ""
 	}
@@ -275,7 +281,7 @@ func (e *Engine) TryBetter() string {
 // betterCandidates are the healthy endpoints configured ahead of the active
 // one, in the configured order. Ahead of an ordinary endpoint are the ordinary
 // ones before it; ahead of a CDN fallback is every ordinary endpoint.
-func (e *Engine) betterCandidates(config mobileConfig, active string, now time.Time) []endpoint {
+func (e *Engine) betterCandidates(config mobileConfig, active, skipKind string, now time.Time) []endpoint {
 	points := usablePoints(config)
 	index := pointIndex(points, active)
 	if index < 0 {
@@ -284,7 +290,7 @@ func (e *Engine) betterCandidates(config mobileConfig, active string, now time.T
 	fromFallback := isFallback(config, points[index])
 	var candidates []endpoint
 	for i, p := range points {
-		if p.ID == active || isFallback(config, p) || (!fromFallback && i > index) {
+		if p.ID == active || p.Kind == skipKind || isFallback(config, p) || (!fromFallback && i > index) {
 			continue
 		}
 		if _, bad := e.history.unhealthySince(p.ID, now); !bad {

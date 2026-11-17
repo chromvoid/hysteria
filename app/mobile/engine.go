@@ -46,12 +46,11 @@ type profile struct {
 }
 
 type mobileConfig struct {
-	Profile           profile    `json:"profile"`
-	Endpoints         []endpoint `json:"endpoints"`
-	PreferredEndpoint string     `json:"preferred_endpoint"`
-	WhitelistMode     bool       `json:"whitelist_mode"`
-	// AdaptiveEndpoints orders attempts by endpoint history and keeps CDN endpoints as the last fallback.
-	AdaptiveEndpoints bool          `json:"adaptive_endpoints"`
+	Profile           profile       `json:"profile"`
+	Endpoints         []endpoint    `json:"endpoints"`
+	PreferredEndpoint string        `json:"preferred_endpoint"`
+	WhitelistMode     bool          `json:"whitelist_mode"`
+	AdaptiveEndpoints bool          `json:"adaptive_endpoints"` // See attemptOrder.
 	Routing           string        `json:"routing"`
 	Rules             *routingRules `json:"rules"`
 }
@@ -294,7 +293,11 @@ func (e *Engine) connect(first string) error {
 			}
 			continue
 		}
-		since := wallNow()
+		// Without adaptive endpoints the clock is read exactly as before.
+		var since time.Time
+		if config.AdaptiveEndpoints {
+			since = wallNow()
+		}
 		e.mu.Lock()
 		if e.closed || e.ctx.Err() != nil {
 			e.mu.Unlock()
@@ -554,7 +557,10 @@ func (e *Engine) TrySwitch(id string) bool {
 func (e *Engine) promote(transport vpnTransport, id string, gen uint64, adaptive bool) bool {
 	e.reconnectMu.Lock()
 	defer e.reconnectMu.Unlock()
-	since := wallNow()
+	var since time.Time
+	if adaptive {
+		since = wallNow()
+	}
 	e.mu.Lock()
 	if e.closed || e.generation.Load() != gen {
 		e.mu.Unlock()
