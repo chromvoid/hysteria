@@ -117,7 +117,7 @@ type Engine struct {
 	hy          vpnTransport
 	activeID    string
 	lastGoodID  string
-	activeSince time.Time // Wall time activeID became active; zero after ResetEndpointHistory.
+	activeSince time.Time // Wall time activeID became active; zero when the run is not judged.
 	closed      bool
 	reconnectMu sync.Mutex
 	switching   atomic.Bool
@@ -288,7 +288,8 @@ func (e *Engine) connect(first string) error {
 		report = append(report, endpointAttempt{ID: p.ID, Kind: p.Kind, Stage: stage, MS: max(0, wallNow().Sub(started).Milliseconds())})
 		allAuth = allAuth && stage == "auth"
 		if err != nil {
-			if config.AdaptiveEndpoints {
+			// A start that Close cut short says nothing about the endpoint.
+			if config.AdaptiveEndpoints && e.ctx.Err() == nil {
 				e.history.startFailed(p.ID, wallNow())
 			}
 			continue

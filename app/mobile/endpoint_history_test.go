@@ -129,11 +129,11 @@ func TestAdaptiveAttemptOrder(t *testing.T) {
 		if got := order(e, ""); got != "reality relay cdn cdn2 udp" {
 			t.Fatalf("Order after a failed start = %q", got)
 		}
-		clock.Add(int64(startFailMemory - time.Second))
+		clock.Add(int64(startFailMemory - time.Minute))
 		if got := order(e, ""); got != "reality relay cdn cdn2 udp" {
 			t.Fatalf("Order just before the memory ends = %q", got)
 		}
-		clock.Add(int64(time.Second))
+		clock.Add(int64(time.Minute))
 		if got := order(e, ""); got != "udp reality relay cdn cdn2" {
 			t.Fatalf("Order after the memory ends = %q", got)
 		}
@@ -274,6 +274,18 @@ func TestAdaptiveReconnectAndTryBetter(t *testing.T) {
 	if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != "a" {
 		t.Fatalf("Reconnect with the others down = %q, %v", e.ActiveEndpoint(), err)
 	}
+	if err := json.Unmarshal([]byte(e.EndpointHistory()), &entries); err != nil || len(entries) != 3 || entries[1].ID != "b" || entries[2].ID != "c" || !near(entries[1].StartFailedAt, wallNow()) || !near(entries[2].StartFailedAt, wallNow()) || entries[0].StartFailedAt != 0 {
+		t.Fatalf("History after failed starts in a reconnect = %s, %v", e.EndpointHistory(), err)
+	}
+	// A clock that went back neither penalises a run nor keeps a failed start alive.
+	clock.Add(-int64(time.Hour))
+	if got := endpointIDs(e.attemptOrder(e.config, "")); got != "a b c" {
+		t.Fatalf("Order after the clock went back = %q", got)
+	}
+	if err := e.Reconnect(); err != nil || e.ActiveEndpoint() != "a" {
+		t.Fatalf("Reconnect after the clock went back = %q, %v", e.ActiveEndpoint(), err)
+	}
+	clock.Add(int64(time.Hour))
 
 	// A network change forgets the history and the run of the active endpoint.
 	e.ResetEndpointHistory()

@@ -12,12 +12,11 @@ import (
 // doubling with each drop in a row up to penaltyMax. The numbers match the
 // node penalties of the Wayveil Go client.
 const (
-	stableUptime     = 10 * time.Minute
-	penaltyBase      = 10 * time.Minute
-	penaltyMax       = 6 * time.Hour
-	startFailMemory  = 10 * time.Minute
-	cdnEndpointKind  = "vless_xhttp_cdn"
-	tryBetterTimeout = 10 * time.Second
+	stableUptime    = 10 * time.Minute
+	penaltyBase     = 10 * time.Minute
+	penaltyMax      = 6 * time.Hour
+	startFailMemory = 10 * time.Minute
+	cdnEndpointKind = "vless_xhttp_cdn"
 )
 
 type endpointRecord struct {
@@ -32,6 +31,18 @@ type endpointRecord struct {
 type endpointHistory struct {
 	mu      sync.Mutex
 	records map[string]*endpointRecord
+}
+
+// penalized reports whether the penalty is running. One that starts after
+// now, left by a clock that went back, is not.
+func (r *endpointRecord) penalized(now time.Time) bool {
+	return r.penaltyUntil.After(now) && !now.Before(r.penalizedAt)
+}
+
+// remembersFailure reports whether the failed start still counts. One dated
+// after now, left by a clock that went back, does not.
+func (r *endpointRecord) remembersFailure(now time.Time) bool {
+	return !r.failedAt.IsZero() && !now.Before(r.failedAt) && now.Sub(r.failedAt) < startFailMemory
 }
 
 func (h *endpointHistory) record(id string) *endpointRecord {
@@ -69,7 +80,8 @@ func (h *endpointHistory) started(id string) {
 // stableUptime or longer clears its penalties; a shorter one that ended in a
 // drop adds a penalty.
 func (h *endpointHistory) ended(id string, since, now time.Time, dropped bool) {
-	if id == "" || since.IsZero() {
+	// A clock that went back leaves the length of the run unknown.
+	if id == "" || since.IsZero() || now.Before(since) {
 		return
 	}
 	h.mu.Lock()
@@ -107,10 +119,10 @@ func (h *endpointHistory) unhealthySince(id string, now time.Time) (time.Time, b
 		return time.Time{}, false
 	}
 	var at time.Time
-	if r.penaltyUntil.After(now) {
+	if r.penalized(now) {
 		at = r.penalizedAt
 	}
-	if !r.failedAt.IsZero() && now.Sub(r.failedAt) < startFailMemory && r.failedAt.After(at) {
+	if r.remembersFailure(now) && r.failedAt.After(at) {
 		at = r.failedAt
 	}
 	return at, !at.IsZero()
@@ -135,10 +147,10 @@ func (h *endpointHistory) entries(now time.Time) []endpointHistoryEntry {
 	entries := make([]endpointHistoryEntry, 0, len(h.records))
 	for id, r := range h.records {
 		entry := endpointHistoryEntry{ID: id, Strikes: r.strikes}
-		if r.penaltyUntil.After(now) {
+		if r.penalized(now) {
 			entry.PenaltyUntil = r.penaltyUntil.Unix()
 		}
-		if !r.failedAt.IsZero() && now.Sub(r.failedAt) < startFailMemory {
+		if r.remembersFailure(now) {
 			entry.StartFailedAt = r.failedAt.Unix()
 		}
 		if entry.PenaltyUntil != 0 || entry.Strikes != 0 || entry.StartFailedAt != 0 {
@@ -265,7 +277,7 @@ func (e *Engine) TryBetter(skipKind string) string {
 		if ctx.Err() != nil || !wallNow().Before(deadline) {
 			return ""
 		}
-		transport, ok := e.probeCandidate(ctx, p, tryBetterTimeout, true)
+		transport, ok := e.probeCandidate(ctx, p, min(endpointTimeout, deadline.Sub(wallNow())), true)
 		if !ok {
 			continue
 		}
@@ -323,8 +335,8 @@ func (e *Engine) probeCandidate(parent context.Context, p endpoint, timeout time
 
 // ResetEndpointHistory forgets every penalty and failed start. Clients call it
 // when the network changes: the history describes the previous network. The
-// run of the active endpoint restarts too, so a drop caused by the change is
-// not counted against it.
+// current run of the active endpoint is no longer judged either, so the
+// reconnect that follows the change is not counted against it.
 func (e *Engine) ResetEndpointHistory() {
 	e.mu.Lock()
 	e.activeSince = time.Time{}
@@ -336,6 +348,14 @@ func (e *Engine) ResetEndpointHistory() {
 // penalty, strikes or a remembered failed start: id, penalty_until and
 // start_failed_at in Unix seconds (0 when absent) and strikes.
 func (e *Engine) EndpointHistory() string {
-	encoded, _ := json.Marshal(e.history.entries(wallNow()))
+	now := wallNow()
+	e.mu.RLock()
+	active, since := e.activeID, e.activeSince
+	e.mu.RUnlock()
+	// A run that is already stable has cleared the endpoint; do not wait for its end to show it.
+	if active != "" && !since.IsZero() && now.Sub(since) >= stableUptime {
+		e.history.ended(active, since, now, false)
+	}
+	encoded, _ := json.Marshal(e.history.entries(now))
 	return string(encoded)
 }
